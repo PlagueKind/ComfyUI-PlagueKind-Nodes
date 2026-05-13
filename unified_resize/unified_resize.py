@@ -42,7 +42,7 @@ class UnifiedResizeImageMask:
     RETURN_NAMES = ("image", "mask", "width", "height")
 
     FUNCTION = "resize"
-    CATEGORY = "image"
+    CATEGORY = "PlagueKind/image"
 
     # -------------------------
     # SIZE LOGIC
