@@ -21,7 +21,7 @@ A single ComfyUI node that ensures consistent resizing behavior between images a
 
 - Aspect-ratio preservation option
 - Center crop alignment
-- Divisible-by constraint (useful for latent models like LTX-2.3 / SDXL workflows)
+- Divisible-by constraint (useful for latent models like LTX-2.3 / SDXL workflows, where other nodes only do one side.)
 - Unified image + mask transformation pipeline
 - Stable tensor-based mask resizing (no PIL dependency issues)
 
