@@ -8,6 +8,8 @@ ComfyUI custom nodes providing unified image and mask resizing with multiple sca
 
 A single ComfyUI node that ensures consistent resizing behavior between images and masks using a unified geometric pipeline.
 
+<img width="256" height="256" alt="Screenshot_20260513_233656" src="https://github.com/user-attachments/assets/9c4f69dd-8e9a-4ad8-a28e-66760a087793" />
+
 ---
 
 ## Features
