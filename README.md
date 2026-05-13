@@ -1,15 +1,16 @@
-# Comfyui-PlagueKind-Nodes
-ComfyUI custom node providing unified image and mask resizing with support for multiple scaling modes, aspect-ratio preservation, center crop alignment, and stable tensor-based mask transformations.
+# ComfyUI-PlagueKind-Nodes
 
-Custom nodes for ComfyUI focused on controlled image and mask processing workflows.
+ComfyUI custom nodes providing unified image and mask resizing with multiple scaling modes, aspect-ratio preservation, center crop alignment, and stable tensor-based mask transformations.
 
 ---
 
 ## Unified Resize Image / Mask
 
-A single ComfyUI node that provides unified resizing logic for both images and masks with consistent geometry handling.
+A single ComfyUI node that ensures consistent resizing behavior between images and masks using a unified geometric pipeline.
 
-### Features
+---
+
+## Features
 
 - Multiple scaling modes:
   - Dimensions (W × H)
@@ -20,7 +21,7 @@ A single ComfyUI node that provides unified resizing logic for both images and m
 
 - Aspect-ratio preservation option
 - Center crop alignment
-- Divisible-by constraint (useful for latent models like LTX-2.3)
+- Divisible-by constraint (useful for latent models like LTX-2.3 / SDXL workflows)
 - Unified image + mask transformation pipeline
 - Stable tensor-based mask resizing (no PIL dependency issues)
 
@@ -28,10 +29,11 @@ A single ComfyUI node that provides unified resizing logic for both images and m
 
 ## Why this node exists
 
-ComfyUI default workflows often suffer from:
-- mask stretching inconsistencies
-- image/mask misalignment after resize
-- inconsistent crop behavior between pipelines
+Default ComfyUI workflows often suffer from:
+
+- mask stretching inconsistencies  
+- image/mask misalignment after resize  
+- inconsistent crop behavior between pipelines  
 
 This node ensures both image and mask follow identical geometric transformations for predictable inpainting and compositing results.
 
@@ -40,6 +42,12 @@ This node ensures both image and mask follow identical geometric transformations
 ## Installation
 
 ### Manual install
+
+Clone into your ComfyUI custom nodes folder:
+
+```bash
+cd ComfyUI/custom_nodes
+git clone https://github.com/PlagueKind/ComfyUI-PlagueKind-Nodes.git
 
 Clone into your ComfyUI custom nodes folder:
 
