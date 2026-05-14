@@ -85,13 +85,16 @@ class UnifiedResizeImageMask:
             return w, h
 
         if maintain_aspect:
+
             aspect = w / h
+
             if w >= h:
                 w = self.snap(w, div)
-                h = int(w / aspect)
+                h = self.snap(int(w / aspect), div)
             else:
                 h = self.snap(h, div)
-                w = int(h * aspect)
+                w = self.snap(int(h * aspect), div)
+
             return w, h
 
         return self.snap(w, div), self.snap(h, div)
@@ -99,50 +102,84 @@ class UnifiedResizeImageMask:
     # -------------------------
     # IMAGE PIPELINE
     # -------------------------
-    def resize_image(self, x, target_w, target_h, method):
+    def resize_image(self, x, target_w, target_h, method, crop_mode):
 
         x = x.movedim(-1, 1)
 
-        ow = x.shape[3]
-        oh = x.shape[2]
+        if crop_mode == "center":
 
-        scale = max(target_w / ow, target_h / oh)
+            ow = x.shape[3]
+            oh = x.shape[2]
 
-        sw = int(ow * scale)
-        sh = int(oh * scale)
+            scale = max(target_w / ow, target_h / oh)
 
-        x = comfy.utils.common_upscale(x, sw, sh, method, False)
+            sw = int(ow * scale)
+            sh = int(oh * scale)
 
-        _, _, ch, cw = x.shape
+            x = comfy.utils.common_upscale(
+                x,
+                sw,
+                sh,
+                method,
+                False
+            )
 
-        top = (ch - target_h) // 2
-        left = (cw - target_w) // 2
+            _, _, ch, cw = x.shape
 
-        x = x[:, :, top:top + target_h, left:left + target_w]
+            top = (ch - target_h) // 2
+            left = (cw - target_w) // 2
+
+            x = x[:, :, top:top + target_h, left:left + target_w]
+
+        else:
+
+            x = comfy.utils.common_upscale(
+                x,
+                target_w,
+                target_h,
+                method,
+                False
+            )
 
         return x.movedim(1, -1)
 
     # -------------------------
-    # MASK PIPELINE (FIXED - NO PIL)
+    # MASK PIPELINE
     # -------------------------
-    def resize_mask(self, mask, target_w, target_h):
+    def resize_mask(self, mask, target_w, target_h, crop_mode):
 
         m = mask.unsqueeze(1).float()
 
-        oh = m.shape[2]
-        ow = m.shape[3]
+        if crop_mode == "center":
 
-        scale = max(target_w / ow, target_h / oh)
+            oh = m.shape[2]
+            ow = m.shape[3]
 
-        sw = int(ow * scale)
-        sh = int(oh * scale)
+            scale = max(target_w / ow, target_h / oh)
 
-        m = F.interpolate(m, size=(sh, sw), mode="bilinear", align_corners=False)
+            sw = int(ow * scale)
+            sh = int(oh * scale)
 
-        top = (sh - target_h) // 2
-        left = (sw - target_w) // 2
+            m = F.interpolate(
+                m,
+                size=(sh, sw),
+                mode="bilinear",
+                align_corners=False
+            )
 
-        m = m[:, :, top:top + target_h, left:left + target_w]
+            top = (sh - target_h) // 2
+            left = (sw - target_w) // 2
+
+            m = m[:, :, top:top + target_h, left:left + target_w]
+
+        else:
+
+            m = F.interpolate(
+                m,
+                size=(target_h, target_w),
+                mode="bilinear",
+                align_corners=False
+            )
 
         return m.squeeze(1)
 
@@ -181,10 +218,22 @@ class UnifiedResizeImageMask:
         w, h = self.resolve_size(scale_mode, orig_w, orig_h, kw)
         w, h = self.apply_divisible(w, h, divisible_by, maintain_aspect)
 
-        img = self.resize_image(image, w, h, upscale_method)
+        img = self.resize_image(
+            image,
+            w,
+            h,
+            upscale_method,
+            crop
+        )
 
         if mask is not None:
-            mask = self.resize_mask(mask, w, h)
+
+            mask = self.resize_mask(
+                mask,
+                w,
+                h,
+                crop
+            )
 
         return (img, mask, w, h)
 
