@@ -51,7 +51,8 @@ Category: image
 
 A 10-slot LoRA stacking node designed for LTX-2.3 workflows, featuring independent video and audio branch strength control per LoRA, optional CLIP passthrough, and structured stacking for advanced diffusion pipelines. This node also works as a standard LoRA loader for any compatible model.
 
-<img width="256" height="256" alt="LTX LoRA Stack Node" src="https://github.com/user-attachments/assets/placeholder.png" />
+<img width="256" height="171" alt="Screenshot_20260529_184720" src="https://github.com/user-attachments/assets/ed7e8083-8f1c-4b1e-89fb-8f60f2025f34" />
+
 
 ### Features
 
