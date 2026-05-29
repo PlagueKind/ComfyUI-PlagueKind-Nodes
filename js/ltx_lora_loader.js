@@ -433,7 +433,7 @@ app.registerExtension({
                     lbl.style.fontSize = "10px";
 
                     const inp = document.createElement("input");
-                    inp.type = "text"; inp.inputMode = "decimal"; inp.value = Number.isFinite(Number(val)) ? Number(val).toFixed(1) : "0.0";
+                    inp.type = "text"; inp.inputMode = "decimal"; inp.value = Number.isFinite(Number(val)) ? Number(val).toFixed(2) : "0.00";
                     inp.style.cssText = inputStyle + "width:42px;text-align:center;flex-shrink:0;box-sizing:border-box;";
 
                     inp.addEventListener("change", syncData);
@@ -443,7 +443,7 @@ app.registerExtension({
                         e.preventDefault();
                         e.stopPropagation();
                         showNumPopup(inp.value, label, (newVal) => {
-                            inp.value = newVal.toFixed(1);
+                            inp.value = newVal.toFixed(2);
                             syncData();
                         });
                     });
