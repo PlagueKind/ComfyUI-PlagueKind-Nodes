@@ -44,64 +44,67 @@ class UnifiedResizeImageMask:
     FUNCTION = "resize"
     CATEGORY = "PlagueKind/image"
 
-    # -------------------------
-    # SIZE LOGIC
-    # -------------------------
+    def safe_dim(self, v):
+        return max(1, int(round(v)))
+
     def resolve_size(self, mode, w, h, kw):
 
+        w = max(1, int(w))
+        h = max(1, int(h))
+
         if mode == "Dimensions (W × H)":
-            return kw["width"], kw["height"]
+            return self.safe_dim(kw["width"]), self.safe_dim(kw["height"])
 
         if mode == "Multiplier":
-            return int(w * kw["multiplier"]), int(h * kw["multiplier"])
+            return self.safe_dim(w * kw["multiplier"]), self.safe_dim(h * kw["multiplier"])
 
         if mode == "Longer Side":
-            target = kw["long_side_target"]
-            scale = target / (w if w >= h else h)
-            return int(w * scale), int(h * scale)
+            target = max(1, int(kw["long_side_target"]))
+            scale = target / max(w, h)
+            return self.safe_dim(w * scale), self.safe_dim(h * scale)
 
         if mode == "Shorter Side":
-            target = kw["short_side_target"]
-            scale = target / (w if w <= h else h)
-            return int(w * scale), int(h * scale)
+            target = max(1, int(kw["short_side_target"]))
+            scale = target / min(w, h)
+            return self.safe_dim(w * scale), self.safe_dim(h * scale)
 
         if mode == "Total Pixels (MP)":
-            aspect = w / h
-            mp = kw["megapixels"] * 1_000_000
-            nw = int(math.sqrt(mp * aspect))
-            nh = int(mp / nw)
+            aspect = w / h if h else 1.0
+            area = max(0.000001, float(kw["megapixels"])) * 1_000_000.0
+            nw = max(1, int(round(math.sqrt(area * aspect))))
+            nh = max(1, int(round(area / max(1, nw))))
             return nw, nh
 
         return w, h
 
     def snap(self, v, div):
+        v = max(1, int(v))
         if div <= 1:
             return v
         return max(div, (v // div) * div)
 
     def apply_divisible(self, w, h, div, maintain_aspect):
 
+        w = max(1, int(w))
+        h = max(1, int(h))
+
         if div <= 1:
             return w, h
 
         if maintain_aspect:
-
-            aspect = w / h
+            aspect = w / h if h else 1.0
 
             if w >= h:
                 w = self.snap(w, div)
-                h = self.snap(int(w / aspect), div)
+                h = self.snap(max(1, int(round(w / aspect))), div)
             else:
                 h = self.snap(h, div)
-                w = self.snap(int(h * aspect), div)
+                w = self.snap(max(1, int(round(h * aspect))), div)
 
-            return w, h
+            return max(1, w), max(1, h)
 
-        return self.snap(w, div), self.snap(h, div)
+        return max(1, self.snap(w, div)), max(1, self.snap(h, div))
 
-    # -------------------------
-    # IMAGE PIPELINE
-    # -------------------------
     def resize_image(self, x, target_w, target_h, method, crop_mode):
 
         x = x.movedim(-1, 1)
@@ -113,8 +116,8 @@ class UnifiedResizeImageMask:
 
             scale = max(target_w / ow, target_h / oh)
 
-            sw = int(ow * scale)
-            sh = int(oh * scale)
+            sw = max(1, int(round(ow * scale)))
+            sh = max(1, int(round(oh * scale)))
 
             x = comfy.utils.common_upscale(
                 x,
@@ -126,8 +129,8 @@ class UnifiedResizeImageMask:
 
             _, _, ch, cw = x.shape
 
-            top = (ch - target_h) // 2
-            left = (cw - target_w) // 2
+            top = max(0, (ch - target_h) // 2)
+            left = max(0, (cw - target_w) // 2)
 
             x = x[:, :, top:top + target_h, left:left + target_w]
 
@@ -143,9 +146,6 @@ class UnifiedResizeImageMask:
 
         return x.movedim(1, -1)
 
-    # -------------------------
-    # MASK PIPELINE
-    # -------------------------
     def resize_mask(self, mask, target_w, target_h, crop_mode):
 
         m = mask.unsqueeze(1).float()
@@ -157,8 +157,8 @@ class UnifiedResizeImageMask:
 
             scale = max(target_w / ow, target_h / oh)
 
-            sw = int(ow * scale)
-            sh = int(oh * scale)
+            sw = max(1, int(round(ow * scale)))
+            sh = max(1, int(round(oh * scale)))
 
             m = F.interpolate(
                 m,
@@ -167,8 +167,8 @@ class UnifiedResizeImageMask:
                 align_corners=False
             )
 
-            top = (sh - target_h) // 2
-            left = (sw - target_w) // 2
+            top = max(0, (sh - target_h) // 2)
+            left = max(0, (sw - target_w) // 2)
 
             m = m[:, :, top:top + target_h, left:left + target_w]
 
@@ -183,9 +183,6 @@ class UnifiedResizeImageMask:
 
         return m.squeeze(1)
 
-    # -------------------------
-    # MAIN
-    # -------------------------
     def resize(
         self,
         image,
@@ -217,6 +214,7 @@ class UnifiedResizeImageMask:
 
         w, h = self.resolve_size(scale_mode, orig_w, orig_h, kw)
         w, h = self.apply_divisible(w, h, divisible_by, maintain_aspect)
+        w, h = max(1, int(w)), max(1, int(h))
 
         img = self.resize_image(
             image,
