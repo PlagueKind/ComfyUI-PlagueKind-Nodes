@@ -4,7 +4,6 @@ app.registerExtension({
     name: "UnifiedResizeImageMask.UI",
 
     async beforeRegisterNodeDef(nodeType, nodeData) {
-
         if (nodeData.name !== "UnifiedResizeImageMask") {
             return;
         }
@@ -43,7 +42,6 @@ app.registerExtension({
         const origOnNodeCreated = nodeType.prototype.onNodeCreated;
 
         nodeType.prototype.onNodeCreated = function () {
-
             const r = origOnNodeCreated
             ? origOnNodeCreated.apply(this, arguments)
             : undefined;
@@ -51,7 +49,6 @@ app.registerExtension({
             const node = this;
 
             function applyVisibility() {
-
                 const modeWidget = node.widgets?.find(
                     w => w.name === "scale_mode"
                 );
@@ -63,7 +60,6 @@ app.registerExtension({
                 const show = modeMap[modeWidget.value] || [];
 
                 for (const w of node.widgets || []) {
-
                     if (LABELS[w.name]) {
                         w.label = LABELS[w.name];
                     }
@@ -85,15 +81,12 @@ app.registerExtension({
             );
 
             if (modeWidget) {
-
                 const origCallback = modeWidget.callback;
 
                 modeWidget.callback = function (...args) {
-
                     if (origCallback) {
                         origCallback.apply(this, args);
                     }
-
                     applyVisibility();
                 };
             }
@@ -101,6 +94,45 @@ app.registerExtension({
             requestAnimationFrame(() => {
                 applyVisibility();
             });
+
+            const resWidget = node.addWidget("text", "resolution_display", "Resolution: (pending)", () => {}, { serialize: false });
+
+            resWidget.draw = function(ctx, node, widget_width, y, widget_height) {
+                ctx.beginPath();
+                ctx.moveTo(15, y + 4);
+                ctx.lineTo(widget_width - 15, y + 4);
+                ctx.lineWidth = 1;
+                ctx.strokeStyle = "rgba(255, 255, 255, 0.2)";
+                ctx.stroke();
+
+                ctx.fillStyle = (typeof LiteGraph !== "undefined" && LiteGraph.WIDGET_TEXT_COLOR) ? LiteGraph.WIDGET_TEXT_COLOR : "#a9a9a9";
+                ctx.font = "13px Arial";
+                ctx.textAlign = "center";
+                ctx.fillText(this.value, widget_width * 0.5, y + 22);
+            };
+
+            resWidget.computeSize = function() {
+                return [0, 30];
+            };
+
+            return r;
+        };
+
+        const origOnExecuted = nodeType.prototype.onExecuted;
+
+        nodeType.prototype.onExecuted = function (message) {
+            const r = origOnExecuted ? origOnExecuted.apply(this, arguments) : undefined;
+
+            if (message?.text) {
+                let widget = this.widgets?.find(w => w.name === "resolution_display");
+                if (widget) {
+                    widget.value = message.text[0];
+                    this.setSize(this.computeSize());
+                    if (this.graph) {
+                        this.graph.setDirtyCanvas(true, true);
+                    }
+                }
+            }
 
             return r;
         };

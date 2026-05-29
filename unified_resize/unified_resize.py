@@ -48,7 +48,6 @@ class UnifiedResizeImageMask:
         return max(1, int(round(v)))
 
     def resolve_size(self, mode, w, h, kw):
-
         w = max(1, int(w))
         h = max(1, int(h))
 
@@ -84,7 +83,6 @@ class UnifiedResizeImageMask:
         return max(div, (v // div) * div)
 
     def apply_divisible(self, w, h, div, maintain_aspect):
-
         w = max(1, int(w))
         h = max(1, int(h))
 
@@ -106,11 +104,9 @@ class UnifiedResizeImageMask:
         return max(1, self.snap(w, div)), max(1, self.snap(h, div))
 
     def resize_image(self, x, target_w, target_h, method, crop_mode):
-
         x = x.movedim(-1, 1)
 
         if crop_mode == "center":
-
             ow = x.shape[3]
             oh = x.shape[2]
 
@@ -135,7 +131,6 @@ class UnifiedResizeImageMask:
             x = x[:, :, top:top + target_h, left:left + target_w]
 
         else:
-
             x = comfy.utils.common_upscale(
                 x,
                 target_w,
@@ -147,11 +142,9 @@ class UnifiedResizeImageMask:
         return x.movedim(1, -1)
 
     def resize_mask(self, mask, target_w, target_h, crop_mode):
-
         m = mask.unsqueeze(1).float()
 
         if crop_mode == "center":
-
             oh = m.shape[2]
             ow = m.shape[3]
 
@@ -173,7 +166,6 @@ class UnifiedResizeImageMask:
             m = m[:, :, top:top + target_h, left:left + target_w]
 
         else:
-
             m = F.interpolate(
                 m,
                 size=(target_h, target_w),
@@ -199,7 +191,6 @@ class UnifiedResizeImageMask:
         short_side_target=768,
         maintain_aspect=True
     ):
-
         orig_h = image.shape[1]
         orig_w = image.shape[2]
 
@@ -225,7 +216,6 @@ class UnifiedResizeImageMask:
         )
 
         if mask is not None:
-
             mask = self.resize_mask(
                 mask,
                 w,
@@ -233,7 +223,10 @@ class UnifiedResizeImageMask:
                 crop
             )
 
-        return (img, mask, w, h)
+        return {
+            "ui": {"text": [f"Resized to: {w} × {h}"]},
+            "result": (img, mask, w, h)
+        }
 
 
 NODE_CLASS_MAPPINGS = {
