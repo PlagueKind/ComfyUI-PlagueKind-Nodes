@@ -3,6 +3,56 @@ import { app } from "/scripts/app.js";
 app.registerExtension({
     name: "UnifiedResizeImageMask.UI",
 
+    setup() {
+        const applyPrototypePatch = () => {
+            for (const node of app.graph?._nodes ?? []) {
+                for (const w of node.widgets ?? []) {
+                    if (w.constructor?.name === "PromotedWidgetView" && !w.constructor.prototype._resolutionLabelPatched) {
+                        const proto = w.constructor.prototype;
+                        proto._resolutionLabelPatched = true;
+
+                        const origDraw = proto.draw;
+                        proto.draw = function(ctx, node, widget_width, y, widget_height, showText) {
+                            const deep = this.resolveDeepest?.();
+                            if (deep?.widget?.isResolutionLabel) {
+                                ctx.save();
+
+                                ctx.beginPath();
+                                ctx.moveTo(15, y + 4);
+                                ctx.lineTo(widget_width - 15, y + 4);
+                                ctx.lineWidth = 1;
+                                ctx.strokeStyle = "rgba(255, 255, 255, 0.2)";
+                                ctx.stroke();
+
+                                ctx.fillStyle = LiteGraph?.WIDGET_TEXT_COLOR ?? "#a9a9a9";
+                                ctx.font = "13px Arial";
+                                ctx.textAlign = "center";
+                                ctx.fillText(this.value, widget_width * 0.5, y + 22);
+
+                                ctx.restore();
+                                return;
+                            }
+                            return origDraw.call(this, ctx, node, widget_width, y, widget_height, showText);
+                        };
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
+
+        const observer = new MutationObserver(() => {
+            if (applyPrototypePatch()) observer.disconnect();
+        });
+            observer.observe(document.body, { childList: true, subtree: true });
+
+            const interval = setInterval(() => {
+                if (applyPrototypePatch()) clearInterval(interval);
+            }, 500);
+
+                setTimeout(() => clearInterval(interval), 30000);
+    },
+
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name !== "UnifiedResizeImageMask") {
             return;
@@ -49,9 +99,7 @@ app.registerExtension({
             const node = this;
 
             function applyVisibility() {
-                const modeWidget = node.widgets?.find(
-                    w => w.name === "scale_mode"
-                );
+                const modeWidget = node.widgets?.find(w => w.name === "scale_mode");
 
                 if (!modeWidget) {
                     return;
@@ -76,9 +124,7 @@ app.registerExtension({
                 }
             }
 
-            const modeWidget = node.widgets?.find(
-                w => w.name === "scale_mode"
-            );
+            const modeWidget = node.widgets?.find(w => w.name === "scale_mode");
 
             if (modeWidget) {
                 const origCallback = modeWidget.callback;
@@ -97,7 +143,12 @@ app.registerExtension({
 
             const resWidget = node.addWidget("text", "resolution_display", "Resolution: (pending)", () => {}, { serialize: false });
 
+            resWidget.mouse = () => false;
+            resWidget.isResolutionLabel = true;
+
             resWidget.draw = function(ctx, node, widget_width, y, widget_height) {
+                ctx.save();
+
                 ctx.beginPath();
                 ctx.moveTo(15, y + 4);
                 ctx.lineTo(widget_width - 15, y + 4);
@@ -105,10 +156,12 @@ app.registerExtension({
                 ctx.strokeStyle = "rgba(255, 255, 255, 0.2)";
                 ctx.stroke();
 
-                ctx.fillStyle = (typeof LiteGraph !== "undefined" && LiteGraph.WIDGET_TEXT_COLOR) ? LiteGraph.WIDGET_TEXT_COLOR : "#a9a9a9";
+                ctx.fillStyle = LiteGraph?.WIDGET_TEXT_COLOR ?? "#a9a9a9";
                 ctx.font = "13px Arial";
                 ctx.textAlign = "center";
                 ctx.fillText(this.value, widget_width * 0.5, y + 22);
+
+                ctx.restore();
             };
 
             resWidget.computeSize = function() {
