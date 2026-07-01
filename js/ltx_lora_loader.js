@@ -84,7 +84,7 @@ app.registerExtension({
             color: var(--input-text);
             border: 1px solid var(--border-color);
             border-radius: 4px; padding: 2px 4px;
-            font-size: 12px; outline: none;
+            font-size: 10px; outline: none;
             transition: all 0.1s ease;
             box-sizing: border-box;
             `;
@@ -434,7 +434,7 @@ app.registerExtension({
 
                     const inp = document.createElement("input");
                     inp.type = "text"; inp.inputMode = "decimal"; inp.value = Number.isFinite(Number(val)) ? Number(val).toFixed(2) : "0.00";
-                    inp.style.cssText = inputStyle + "width:42px;text-align:center;flex-shrink:0;box-sizing:border-box;";
+                    inp.style.cssText = inputStyle + "width:33px;text-align:center;flex-shrink:0;box-sizing:border-box;";
 
                     inp.addEventListener("change", syncData);
                     inp.addEventListener("input", syncData);
