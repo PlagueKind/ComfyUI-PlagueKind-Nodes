@@ -144,3 +144,4 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "LTX_lora_loader": "LoRA Loader Stack ( LTX Compatible )",
 }
+
