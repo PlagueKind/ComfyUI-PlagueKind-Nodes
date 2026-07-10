@@ -35,6 +35,11 @@ def _apply_slot(model, clip, lora_name: str, lora_str: float, v_mult: float, a_m
     video_weights = {k: v for k, v in weights.items() if _is_video_key(k)}
     audio_weights = {k: v for k, v in weights.items() if _is_audio_key(k)}
 
+    # non-LTX loras won't match either prefix - fall back to treating the whole
+    # dict as a single (video-slot) weight set so non-LTX models still work.
+    if not video_weights and not audio_weights:
+        video_weights = weights
+
     v_strength = lora_str * v_mult
     a_strength = lora_str * a_mult
 
