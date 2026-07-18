@@ -6,12 +6,23 @@ const NODE_TYPE = "LTX_lora_loader";
 const MAX_SLOTS = 10;
 const MIN_SIZE = [420, 200];
 let _loraCache = ["None"];
+// Every on-canvas node instance registers a refresh callback here so its
+// dropdown/warning state can be updated live, without needing a new node
+// to be created or the page to be reloaded.
+const _liveInstances = new Set();
+
+function _notifyLiveInstances() {
+    for (const refresh of _liveInstances) {
+        try { refresh(); } catch (e) { console.warn("LoRA instance refresh failed", e); }
+    }
+}
 
 async function getLoraList(nodeData) {
     try {
         const list = nodeData?.input?.hidden?.available_loras?.[0] || nodeData?.input?.required?.lora_name?.[0];
         if (Array.isArray(list)) {
             _loraCache = ["None", ...list];
+            _notifyLiveInstances();
         }
     } catch (e) { console.warn("LoRA fetch failed", e); }
 }
@@ -46,11 +57,14 @@ app.registerExtension({
     name: "PlagueKind.LTX_lora_loader",
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name !== NODE_TYPE) return;
+        // Runs every time node defs are (re)registered, including on
+        // "Refresh node definitions" -- not just when a new node instance
+        // is created -- so the dropdown cache actually picks up new loras.
+        await getLoraList(nodeData);
         const orig = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             orig?.apply(this, arguments);
             const node = this;
-            getLoraList(nodeData);
             const ROW_H = 40;
             const BTN_H = 60;
             function minHeight() {
@@ -102,6 +116,18 @@ app.registerExtension({
             function refreshAllDisplayNames() {
                 for (const s of slots) s.refreshDisplayName?.();
             }
+            function refreshLoraState() {
+                for (const s of slots) {
+                    s.checkMissing?.();
+                    s.refreshDisplayName?.();
+                }
+            }
+            _liveInstances.add(refreshLoraState);
+            const origOnRemoved = node.onRemoved;
+            node.onRemoved = function () {
+                _liveInstances.delete(refreshLoraState);
+                origOnRemoved?.apply(this, arguments);
+            };
             function syncData() {
                 const data = slots.map(s => s.getValue());
                 const json = JSON.stringify(data);
