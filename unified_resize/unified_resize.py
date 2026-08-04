@@ -1,4 +1,5 @@
 import math
+import torch
 import comfy.utils
 import torch.nn.functional as F
 
@@ -20,7 +21,6 @@ class UnifiedResizeImageMask:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "image": ("IMAGE",),
                 "scale_mode": (s.scale_modes,),
                 "long_side_target": ("INT", {"default": 1024, "min": 1, "max": 16384}),
                 "short_side_target": ("INT", {"default": 768, "min": 1, "max": 16384}),
@@ -34,6 +34,7 @@ class UnifiedResizeImageMask:
                 "maintain_aspect": ("BOOLEAN", {"default": True}),
             },
             "optional": {
+                "image": ("IMAGE",),
                 "mask": ("MASK",),
             }
         }
@@ -177,10 +178,10 @@ class UnifiedResizeImageMask:
 
     def resize(
         self,
-        image,
+        image=None,
         mask=None,
         scale_mode=None,
-        upscale_method=None,
+        upscale_method="bilinear",
         crop="center",
         divisible_by=32,
         width=1024,
@@ -191,8 +192,16 @@ class UnifiedResizeImageMask:
         short_side_target=768,
         maintain_aspect=True
     ):
-        orig_h = image.shape[1]
-        orig_w = image.shape[2]
+        if image is not None:
+            orig_h = image.shape[1]
+            orig_w = image.shape[2]
+        else:
+            # No image connected: act as a plain resolution selector
+            # (t2i / t2v use case). Aspect-dependent modes (Multiplier,
+            # Longer/Shorter Side, MP) fall back to a square 1x1 source;
+            # use "Dimensions (W x H)" mode for exact width/height control.
+            orig_h = 1
+            orig_w = 1
 
         kw = {
             "width": width,
@@ -207,21 +216,23 @@ class UnifiedResizeImageMask:
         w, h = self.apply_divisible(w, h, divisible_by, maintain_aspect)
         w, h = max(1, int(w)), max(1, int(h))
 
-        img = self.resize_image(
-            image,
-            w,
-            h,
-            upscale_method,
-            crop
-        )
-
-        if mask is not None:
-            mask = self.resize_mask(
-                mask,
+        img = torch.zeros((1, 1, 1, 3))
+        if image is not None:
+            img = self.resize_image(
+                image,
                 w,
                 h,
+                upscale_method,
                 crop
             )
+
+            if mask is not None:
+                mask = self.resize_mask(
+                    mask,
+                    w,
+                    h,
+                    crop
+                )
 
         return {
             "ui": {"text": [f"Resized to: {w} × {h}"]},
