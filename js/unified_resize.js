@@ -117,7 +117,8 @@ app.registerExtension({
                     }
                 }
 
-                node.setSize(node.computeSize());
+                const computed = node.computeSize();
+                node.setSize([node.size[0], computed[1]]);
 
                 if (node.graph) {
                     node.graph.setDirtyCanvas(true, true);
@@ -180,7 +181,8 @@ app.registerExtension({
                 let widget = this.widgets?.find(w => w.name === "resolution_display");
                 if (widget) {
                     widget.value = message.text[0];
-                    this.setSize(this.computeSize());
+                    const computed = this.computeSize();
+                    this.setSize([this.size[0], computed[1]]);
                     if (this.graph) {
                         this.graph.setDirtyCanvas(true, true);
                     }
