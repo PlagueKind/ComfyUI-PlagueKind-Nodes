@@ -47,6 +47,37 @@ Category: image
 
 ---
 
+# Visual Crop + Resize (BBox)
+ 
+Visual, drag-to-crop tools with aspect-ratio locking, available as a standalone crop node or combined with the resize pipeline in a single node.
+ 
+### Features
+ 
+* Interactive drag-and-resize crop box overlay, drawn directly on the node
+* Corner-handle resizing with aspect-ratio lock:
+  * Free
+  * 1:1, 4:3, 3:4, 16:9, 9:16, 21:9, 3:2, 2:3
+  * Custom (numeric ratio)
+* Normalized crop coordinates (0–1), so the box holds its relative position if the source resolution changes
+* Optional numeric override of the crop box, hideable via a single toggle
+* Outputs the crop origin (`x`, `y`) in source-pixel space for compositing the result back onto the original image
+* Combined node chains the crop straight into the same scaling modes, divisible-by constraint, and post-scale center crop as Unified Resize
+### Why these nodes exist
+ 
+Cropping to a specific region or aspect ratio in ComfyUI normally means eyeballing pixel math or reaching for external tools. These nodes let a crop be drawn directly on the node after a single run, then reused and fine-tuned in place.
+ 
+### Nodes
+ 
+**Visual Crop (BBox)**
+Category: image
+Crop only, no resize. Outputs the cropped image/mask plus width, height, x, y.
+ 
+**Visual Crop + Resize (BBox)**
+Category: image
+Crop followed by the full Unified Resize pipeline in one node.
+ 
+---
+
 # LTX LoRA Loader Stack (PlagueKind)
 
 A 10-slot LoRA stacking node designed for LTX-2.3 workflows, featuring independent video and audio branch strength control per LoRA, optional CLIP passthrough, and structured stacking for advanced diffusion pipelines. This node also works as a standard LoRA loader for any compatible model.
