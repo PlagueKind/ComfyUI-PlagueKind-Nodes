@@ -50,7 +50,9 @@ Category: image
 # Visual Crop + Resize (BBox)
  
 Visual, drag-to-crop tools with aspect-ratio locking, available as a standalone crop node or combined with the resize pipeline in a single node.
- 
+
+ <img width="256" height="256" alt="Screenshot_20260806_001136" src="https://github.com/user-attachments/assets/753640d8-a821-4614-8665-1752bc1b2cd6" />
+
 ### Features
  
 * Interactive drag-and-resize crop box overlay, drawn directly on the node
