@@ -1,10 +1,10 @@
 /**
- * LTX LoRA Loader - Dynamic Height Edition (Android & Mobile Layout Hardened)
+ * LTX / MiniMax H3 LoRA Loader - Dynamic Height Edition (Android & Mobile Layout Hardened)
  */
 import { app } from "../../scripts/app.js";
 const NODE_TYPE = "LTX_lora_loader";
 const MAX_SLOTS = 10;
-const MIN_SIZE = [420, 200];
+const MIN_SIZE = [420, 240];
 let _loraCache = ["None"];
 // Every on-canvas node instance registers a refresh callback here so its
 // dropdown/warning state can be updated live, without needing a new node
@@ -81,6 +81,24 @@ app.registerExtension({
             if (stackWidget) {
                 stackWidget.computeSize = () => [0, -4];
                 stackWidget.draw = () => {};
+            }
+            const modeWidget = node.widgets.find(w => w.name === "mode");
+            function applyModeVisibility() {
+                const m = modeWidget ? modeWidget.value : "normal";
+                // MiniMax H3 loras seen so far carry no video_patch_proj/audio_patch_proj
+                // keys, so V/A are dead weight in that mode - keep them LTX-only for now.
+                const showVA = m === "ltx";
+                const showT = m === "minimax";
+                for (const s of slots) s.setVisibility?.(showVA, showT);
+                syncSize();
+            }
+            if (modeWidget) {
+                const origModeCallback = modeWidget.callback;
+                modeWidget.callback = function (...args) {
+                    const r = origModeCallback?.apply(this, args);
+                    applyModeVisibility();
+                    return r;
+                };
             }
             let initialData = [];
             try {
@@ -304,8 +322,11 @@ app.registerExtension({
                     syncData();
                 });
             }
-            function addSlot(data = { on: true, lora: "None", str: 1.0, v: 1.0, a: 1.0 }) {
+            function addSlot(data = { on: true, lora: "None", str: 1.0, v: 1.0, a: 1.0, t: 1.0 }) {
                 if (slots.length >= MAX_SLOTS) return;
+                // backfill fields missing from rows saved before this field existed,
+                // so a stale/partial row doesn't silently default a slider to 0
+                data = { on: true, lora: "None", str: 1.0, v: 1.0, a: 1.0, t: 1.0, ...data };
                 const row = document.createElement("div");
                 row.style.cssText = "display:flex;align-items:center;gap:6px;width:100%;min-height:28px;background:var(--comfy-menu-bg);padding:4px;border-radius:4px;border:1px solid var(--border-color);transition:all 0.15s ease;box-sizing:border-box;";
 
@@ -329,7 +350,7 @@ app.registerExtension({
                 chk.style.flexShrink = "0";
 
                 function updateRowState() {
-                    const targets = [handle, sel, str.wrap, v.wrap, a.wrap, rm];
+                    const targets = [handle, sel, str.wrap, v.wrap, a.wrap, t.wrap, rm];
                     if (chk.checked) {
                         row.style.opacity = "1";
                         row.style.filter = "none";
@@ -479,15 +500,23 @@ app.registerExtension({
                 const str = num(data.str, "S:");
                 const v = num(data.v, "V:");
                 const a = num(data.a, "A:");
+                const t = num(data.t, "T:");
+                function setVisibility(showVA, showT) {
+                    v.wrap.style.display = showVA ? "" : "none";
+                    a.wrap.style.display = showVA ? "" : "none";
+                    t.wrap.style.display = showT ? "" : "none";
+                }
                 function updateTooltips() {
-                    v.inp.title = makeEffectiveTooltip(str.inp, v.inp, "V");
-                    a.inp.title = makeEffectiveTooltip(str.inp, a.inp, "A");
+                    v.inp.title = makeEffectiveTooltip(str.inp, v.inp, "V") + " (no-op unless the LoRA has video-specific keys)";
+                    a.inp.title = makeEffectiveTooltip(str.inp, a.inp, "A") + " (no-op unless the LoRA has audio-specific keys)";
+                    t.inp.title = makeEffectiveTooltip(str.inp, t.inp, "T") + " (MiniMax H3 text I/O only - no effect on LTX loras)";
                     str.inp.title = `S: ${(parseFloat(str.inp.value) || 0).toFixed(2)} (master strength)`;
                 }
                 updateTooltips();
                 str.inp.addEventListener("input", updateTooltips);
                 v.inp.addEventListener("input", updateTooltips);
                 a.inp.addEventListener("input", updateTooltips);
+                t.inp.addEventListener("input", updateTooltips);
 
                 const rm = document.createElement("button");
                 rm.innerHTML = "✖";
@@ -511,8 +540,10 @@ app.registerExtension({
                         lora: sel.dataset.lora,
                         str: parseFloat(str.inp.value) || 0.0,
                                      v: parseFloat(v.inp.value) || 0.0,
-                                     a: parseFloat(a.inp.value) || 0.0
+                                     a: parseFloat(a.inp.value) || 0.0,
+                                     t: parseFloat(t.inp.value) || 0.0
                     }),
+                    setVisibility: setVisibility,
                     getLora: () => sel.dataset.lora,
                       refreshDisplayName: () => {
                           const lora = sel.dataset.lora;
@@ -523,13 +554,14 @@ app.registerExtension({
                       remove: () => { row.remove(); slots = slots.filter(s => s !== slotObj); syncData(); }
                 };
                 rm.onclick = slotObj.remove;
-                row.append(handle, chk, sel, str.wrap, v.wrap, a.wrap, rm);
+                row.append(handle, chk, sel, str.wrap, v.wrap, a.wrap, t.wrap, rm);
                 slots.push(slotObj);
                 makeDraggable(row, slotObj);
                 container.appendChild(row);
 
                 checkMissing();
                 updateRowState();
+                applyModeVisibility();
                 syncData();
             }
             const addBtn = document.createElement("button");
