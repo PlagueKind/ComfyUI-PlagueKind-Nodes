@@ -123,7 +123,7 @@ class H3SLAAttention(io.ComfyNode):
             return io.NodeOutput(model)
 
         try:
-            from patch import patch_h3_sla
+            from .sla import patch_h3_sla
             patched = patch_h3_sla(
                 model,
                 sparsity_ratio=sparsity_ratio,

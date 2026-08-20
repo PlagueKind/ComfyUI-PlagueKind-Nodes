@@ -18,7 +18,7 @@ import torch
 
 from comfy.weight_adapter import LoRAAdapter
 
-from adaln import (ADALN_WEIGHT_SUFFIX, BASIS_SUBDIR, GRID_FILENAME,
+from .adaln import (ADALN_WEIGHT_SUFFIX, BASIS_SUBDIR, GRID_FILENAME,
                     get_basis, get_basis_dense, grid_from_time_embedder,
                     pinv_basis, port_delta, port_factors_reverse)
 

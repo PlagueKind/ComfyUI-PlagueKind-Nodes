@@ -20,8 +20,8 @@ import logging
 
 import torch
 
-from block_map import get_block_map
-from kernel import block_sparse_attention
+from .block_map import get_block_map
+from .kernel import block_sparse_attention
 
 log = logging.getLogger("H3Utils")
 
