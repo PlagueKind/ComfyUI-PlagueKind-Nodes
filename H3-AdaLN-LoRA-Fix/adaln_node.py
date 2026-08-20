@@ -12,7 +12,7 @@ import logging
 
 from comfy_api.latest import io
 
-from . import adaln_patch
+import adaln_patch
 
 log = logging.getLogger("H3AdaLN")
 
