@@ -142,6 +142,21 @@ def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
     return override
 
 
+def _call_next_wrapper(executor, *args, **kwargs):
+    """Advance the ComfyUI wrapper chain instead of jumping to the base model.
+
+    Current ComfyUI ``WrapperExecutor`` instances are callable; calling them
+    advances to the next registered wrapper. Calling ``executor.original`` here
+    would bypass every wrapper installed after SLA (for example Spectrum's H3
+    instrumentation), which makes those patches silently lose the native model
+    call. The type fallback only preserves the tiny executor shims used by this
+    package's historical unit tests and older compatibility harnesses.
+    """
+    if not isinstance(executor, type) and callable(executor):
+        return executor(*args, **kwargs)
+    return executor.original(*args, **kwargs)
+
+
 def _make_wrapper(state, sparsity_ratio, blkq, blkk, dense_last_steps):
     """DIFFUSION_MODEL wrapper: per-step state, and the end-of-run summary.
 
@@ -186,9 +201,14 @@ def _make_wrapper(state, sparsity_ratio, blkq, blkk, dense_last_steps):
         # crash mid-sampling rather than the graceful no-op they should get.
         if minimax_payload is not None:
             kwargs["minimax_payload"] = minimax_payload
-        out = executor.original(x, timestep, context,
-                                transformer_options=transformer_options,
-                                **kwargs)
+        out = _call_next_wrapper(
+            executor,
+            x,
+            timestep,
+            context,
+            transformer_options=transformer_options,
+            **kwargs,
+        )
 
         if state["step"] >= n_steps:
             _summarise(state, sparsity_ratio, blkq, blkk)
