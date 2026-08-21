@@ -135,6 +135,86 @@ class WrapperChainRegression(unittest.TestCase):
 
         self.assertIs(seen["minimax_payload"], payload)
 
+    def test_spectrum_forecasts_do_not_merge_sla_run_state(self):
+        """Skipped NFEs must not make SLA count across independent sampler runs."""
+
+        state = sla_patch._new_state()
+        sla_wrapper = sla_patch._make_wrapper(state, 0.90, 64, 64, 0)
+        summaries = []
+        original_summarise = sla_patch._summarise
+
+        def capture_summary(current_state, *args):
+            summaries.append(current_state["calls"])
+
+        def downstream(executor, *args, **kwargs):
+            # MiniMax-H3 has 50 transformer blocks, hence 50 attention calls
+            # for each actual model evaluation.
+            state["calls"] += 50
+            return executor(*args, **kwargs)
+
+        executor = WrapperExecutor(lambda *a, **k: None, [sla_wrapper, downstream])
+
+        schedule19 = [float(19 - i) for i in range(20)]
+        schedule3 = [3.0, 2.0, 1.0, 0.0]
+
+        def run(schedule, actual_indices):
+            for idx in actual_indices:
+                executor.execute(
+                    object(),
+                    object(),
+                    object(),
+                    transformer_options={
+                        "sample_sigmas": schedule,
+                        "sigmas": [schedule[idx]],
+                    },
+                )
+
+        try:
+            sla_patch._summarise = capture_summary
+
+            # Mirrors the observed Spectrum patterns: 10/19 actuals, then
+            # 12/19 actuals, then two 2/3-actual refinement passes.
+            run(schedule19, [0, 2, 4, 6, 8, 10, 12, 14, 16, 18])
+            run(schedule19, [0, 1, 3, 5, 7, 8, 10, 12, 14, 15, 17, 18])
+            run(schedule3, [0, 2])
+            run(schedule3, [0, 2])
+        finally:
+            sla_patch._summarise = original_summarise
+
+        self.assertEqual(summaries, [500, 600, 100, 100])
+        self.assertTrue(state["summarized"])
+        self.assertEqual(state["step"], 3)
+        self.assertEqual(state["last_step_index"], 2)
+
+    def test_dense_last_steps_uses_logical_sampler_position(self):
+        """Forecasted steps must not shift SLA's trailing-dense window."""
+
+        state = sla_patch._new_state()
+        sla_wrapper = sla_patch._make_wrapper(state, 0.90, 64, 64, 2)
+        dense_flags = []
+
+        def downstream(executor, *args, **kwargs):
+            dense_flags.append(kwargs["transformer_options"]["_h3sla_dense"])
+            return executor(*args, **kwargs)
+
+        executor = WrapperExecutor(lambda *a, **k: None, [sla_wrapper, downstream])
+        schedule = [float(19 - i) for i in range(20)]
+
+        # Only actual model evaluations reach SLA. Steps 17 and 18 are the
+        # logical last two sampler steps even though they are just calls 3/4.
+        for idx in [0, 5, 17, 18]:
+            executor.execute(
+                object(),
+                object(),
+                object(),
+                transformer_options={
+                    "sample_sigmas": schedule,
+                    "sigmas": [schedule[idx]],
+                },
+            )
+
+        self.assertEqual(dense_flags, [False, False, True, True])
+
     def test_legacy_non_callable_test_executor_still_works(self):
         """Keep compatibility with the package's older unit-test executor shim."""
 

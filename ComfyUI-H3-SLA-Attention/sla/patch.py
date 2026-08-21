@@ -33,7 +33,10 @@ def _new_state():
     return {
         "calls": 0,        # sparse invocations this run
         "dense": 0,        # fall-throughs this run
-        "step": 0,
+        "step": 0,         # logical sampler step, 1-based
+        "n_steps": 0,
+        "last_step_index": None,
+        "summarized": False,
         "seq": 0,
         "kept": 0,
         "blocks": 0,
@@ -41,6 +44,21 @@ def _new_state():
         "backend": None,   # what we displaced
         "failed": None,    # first kernel failure, if any
     }
+
+
+def _reset_run_state(state):
+    """Reset per-sampling-run counters while preserving the displaced backend."""
+    state["calls"] = 0
+    state["dense"] = 0
+    state["step"] = 0
+    state["n_steps"] = 0
+    state["last_step_index"] = None
+    state["summarized"] = False
+    state["seq"] = 0
+    state["kept"] = 0
+    state["blocks"] = 0
+    state["pinned"] = 0
+    state["failed"] = None
 
 
 def _summarise(state, sparsity, blkq, blkk):
@@ -157,26 +175,123 @@ def _call_next_wrapper(executor, *args, **kwargs):
     return executor.original(*args, **kwargs)
 
 
+def _sequence_scalar(value):
+    """Return the first scalar from a Python sequence, or None when unavailable."""
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return None
+        return float(value[0])
+    return None
+
+
+def _resolve_sampler_step(transformer_options):
+    """Resolve the logical sampler step from ComfyUI's current/raw sigmas.
+
+    Spectrum can forecast a sampler step without invoking the diffusion model at
+    all. Counting wrapper invocations therefore counts *actual NFEs*, not sampler
+    steps. ComfyUI exposes both the complete schedule (``sample_sigmas``) and the
+    current raw sigma (``sigmas``), which lets SLA recover the real sampler
+    position even when some intermediate model calls were skipped.
+    """
+    sample_sigmas = transformer_options.get("sample_sigmas")
+    current_sigmas = transformer_options.get("sigmas")
+    if sample_sigmas is None or current_sigmas is None:
+        return None
+
+    try:
+        n_steps = len(sample_sigmas) - 1
+    except TypeError:
+        return None
+    if n_steps < 1:
+        return None
+
+    # Keep dependency-free tests cheap and avoid requiring a Torch stub that
+    # implements tensor reductions.
+    if isinstance(sample_sigmas, (list, tuple)):
+        current = _sequence_scalar(current_sigmas)
+        if current is None:
+            try:
+                current = float(current_sigmas)
+            except (TypeError, ValueError):
+                return None
+        try:
+            values = [float(v) for v in sample_sigmas[:-1]]
+        except (TypeError, ValueError):
+            return None
+        if not values:
+            return None
+        step_index = min(range(len(values)), key=lambda i: abs(values[i] - current))
+        return step_index, n_steps
+
+    try:
+        schedule = sample_sigmas.reshape(-1)
+        current = current_sigmas.reshape(-1)
+        if schedule.numel() < 2 or current.numel() == 0:
+            return None
+        current_value = current[0].to(device=schedule.device, dtype=schedule.dtype)
+        step_index = int(torch.argmin(torch.abs(schedule[:-1] - current_value)).item())
+        return step_index, int(schedule.numel()) - 1
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _prepare_run_state(state, transformer_options, sparsity_ratio, blkq, blkk):
+    """Synchronize SLA's run state with the real sampler schedule.
+
+    Returns ``n_steps``. When current sigma metadata is unavailable, this falls
+    back to the historical invocation counter so non-standard callers remain
+    compatible.
+    """
+    resolved = _resolve_sampler_step(transformer_options)
+    if resolved is None:
+        n_steps = max(1, len(transformer_options.get("sample_sigmas", [])) - 1)
+        if state["step"] >= n_steps:
+            if not state["summarized"] and (state["calls"] or state["dense"]):
+                _summarise(state, sparsity_ratio, blkq, blkk)
+            _reset_run_state(state)
+        state["n_steps"] = n_steps
+        state["step"] += 1
+        return n_steps
+
+    step_index, n_steps = resolved
+    last_step_index = state["last_step_index"]
+    new_run = (
+        (state["n_steps"] not in (0, n_steps))
+        or (
+            last_step_index is not None
+            and (
+                step_index < last_step_index
+                or (state["summarized"] and step_index <= last_step_index)
+            )
+        )
+    )
+
+    if new_run:
+        if not state["summarized"] and (state["calls"] or state["dense"]):
+            _summarise(state, sparsity_ratio, blkq, blkk)
+        _reset_run_state(state)
+
+    state["n_steps"] = n_steps
+    state["step"] = step_index + 1
+    state["last_step_index"] = step_index
+    return n_steps
+
+
 def _make_wrapper(state, sparsity_ratio, blkq, blkk, dense_last_steps):
     """DIFFUSION_MODEL wrapper: per-step state, and the end-of-run summary.
 
     Registered once and then reused -- ComfyUI caches node outputs, so this
-    closure outlives a single sampling run. The step counter therefore has to
-    reset itself, or every run after the first drifts permanently into the
-    trailing-dense window and silently stops sparsifying.
+    closure outlives a single sampling run. Spectrum may skip diffusion-model
+    calls on forecasted steps, therefore SLA derives its logical step from
+    ``sample_sigmas`` + current ``sigmas`` instead of counting wrapper calls.
     """
 
     def wrapper(executor, x, timestep, context, transformer_options={},
                 minimax_payload=None, **kwargs):
         to = transformer_options
-        n_steps = max(1, len(to.get("sample_sigmas", [])) - 1)
-
-        if state["step"] >= n_steps:      # new run
-            state["step"] = 0
-            state["calls"] = 0
-            state["dense"] = 0
-            state["failed"] = None
-        state["step"] += 1
+        n_steps = _prepare_run_state(
+            state, to, sparsity_ratio, blkq, blkk
+        )
 
         # PackedLayout.segments is [(start, stop, kind), ...] over
         # [text | cond/ref | audio | video]; the video start is therefore the
@@ -210,8 +325,9 @@ def _make_wrapper(state, sparsity_ratio, blkq, blkk, dense_last_steps):
             **kwargs,
         )
 
-        if state["step"] >= n_steps:
+        if state["step"] >= n_steps and not state["summarized"]:
             _summarise(state, sparsity_ratio, blkq, blkk)
+            state["summarized"] = True
         return out
 
     return wrapper
