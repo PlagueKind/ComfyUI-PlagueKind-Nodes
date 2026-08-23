@@ -60,6 +60,7 @@ app.registerExtension({
 
         const LABELS = {
             scale_mode: "Scale Mode",
+            aspect_ratio: "Aspect Ratio",
             width: "Width",
             height: "Height",
             multiplier: "Multiplier",
@@ -72,12 +73,15 @@ app.registerExtension({
             divisible_by: "Divisible By",
         };
 
+        // aspect_ratio is only shown for modes that derive width/height from
+        // a source aspect ratio. "Dimensions (W x H)" sets both explicitly,
+        // so the preset dropdown doesn't apply there.
         const modeMap = {
             "Dimensions (W × H)": ["width", "height"],
-                      "Multiplier": ["multiplier"],
-                      "Total Pixels (MP)": ["megapixels"],
-                      "Longer Side": ["long_side_target"],
-                      "Shorter Side": ["short_side_target"],
+                      "Multiplier": ["multiplier", "aspect_ratio"],
+                      "Total Pixels (MP)": ["megapixels", "aspect_ratio"],
+                      "Longer Side": ["long_side_target", "aspect_ratio"],
+                      "Shorter Side": ["short_side_target", "aspect_ratio"],
         };
 
         const dimensionWidgets = [
@@ -86,7 +90,8 @@ app.registerExtension({
             "multiplier",
             "megapixels",
             "long_side_target",
-            "short_side_target"
+            "short_side_target",
+            "aspect_ratio"
         ];
 
         const origOnNodeCreated = nodeType.prototype.onNodeCreated;

@@ -17,20 +17,45 @@ class UnifiedResizeImageMask:
         "Total Pixels (MP)",
     ]
 
+    # Same presets (and same order) as ComfyUI core's built-in ResolutionSelector node.
+    aspect_ratios = [
+        "Auto (Input Image)",
+        "1:1 (Square)",
+        "2:3 (Portrait Photo)",
+        "3:2 (Photo)",
+        "3:4 (Portrait Standard)",
+        "4:3 (Standard)",
+        "9:16 (Portrait Widescreen)",
+        "16:9 (Widescreen)",
+        "21:9 (Ultrawide)",
+    ]
+
+    aspect_ratio_values = {
+        "1:1 (Square)": (1.0, 1.0),
+        "2:3 (Portrait Photo)": (2.0, 3.0),
+        "3:2 (Photo)": (3.0, 2.0),
+        "3:4 (Portrait Standard)": (3.0, 4.0),
+        "4:3 (Standard)": (4.0, 3.0),
+        "9:16 (Portrait Widescreen)": (9.0, 16.0),
+        "16:9 (Widescreen)": (16.0, 9.0),
+        "21:9 (Ultrawide)": (21.0, 9.0),
+    }
+
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
                 "scale_mode": (s.scale_modes,),
-                "long_side_target": ("INT", {"default": 1024, "min": 1, "max": 16384}),
-                "short_side_target": ("INT", {"default": 768, "min": 1, "max": 16384}),
-                "width": ("INT", {"default": 1024, "min": 1, "max": 16384}),
-                "height": ("INT", {"default": 1024, "min": 1, "max": 16384}),
+                "aspect_ratio": (s.aspect_ratios,),
+                "long_side_target": ("FLOAT", {"default": 1024.0, "min": 1.0, "max": 16384.0}),
+                "short_side_target": ("FLOAT", {"default": 768.0, "min": 1.0, "max": 16384.0}),
+                "width": ("FLOAT", {"default": 1024.0, "min": 1.0, "max": 16384.0}),
+                "height": ("FLOAT", {"default": 1024.0, "min": 1.0, "max": 16384.0}),
                 "multiplier": ("FLOAT", {"default": 1.0}),
                 "megapixels": ("FLOAT", {"default": 1.0}),
                 "upscale_method": (s.upscale_methods,),
                 "crop": (s.crop_methods,),
-                "divisible_by": ("INT", {"default": 32, "min": 1, "max": 512}),
+                "divisible_by": ("FLOAT", {"default": 32.0, "min": 1.0, "max": 512.0}),
                 "maintain_aspect": ("BOOLEAN", {"default": True}),
             },
             "optional": {
@@ -48,9 +73,16 @@ class UnifiedResizeImageMask:
     def safe_dim(self, v):
         return max(1, int(round(v)))
 
-    def resolve_size(self, mode, w, h, kw):
-        w = max(1, int(w))
-        h = max(1, int(h))
+    def resolve_size(self, mode, w, h, kw, aspect_override=None):
+        w = max(1.0, float(w))
+        h = max(1.0, float(h))
+
+        # Aspect-driven modes (everything but explicit W x H) can have their
+        # source aspect ratio overridden by the aspect_ratio preset dropdown
+        # instead of being derived from the connected image (or the 1x1
+        # fallback when no image is connected).
+        if aspect_override is not None:
+            w, h = aspect_override
 
         if mode == "Dimensions (W × H)":
             return self.safe_dim(kw["width"]), self.safe_dim(kw["height"])
@@ -59,12 +91,12 @@ class UnifiedResizeImageMask:
             return self.safe_dim(w * kw["multiplier"]), self.safe_dim(h * kw["multiplier"])
 
         if mode == "Longer Side":
-            target = max(1, int(kw["long_side_target"]))
+            target = max(1.0, float(kw["long_side_target"]))
             scale = target / max(w, h)
             return self.safe_dim(w * scale), self.safe_dim(h * scale)
 
         if mode == "Shorter Side":
-            target = max(1, int(kw["short_side_target"]))
+            target = max(1.0, float(kw["short_side_target"]))
             scale = target / min(w, h)
             return self.safe_dim(w * scale), self.safe_dim(h * scale)
 
@@ -75,10 +107,11 @@ class UnifiedResizeImageMask:
             nh = max(1, int(round(area / max(1, nw))))
             return nw, nh
 
-        return w, h
+        return self.safe_dim(w), self.safe_dim(h)
 
     def snap(self, v, div):
         v = max(1, int(v))
+        div = max(1, int(round(div)))
         if div <= 1:
             return v
         return max(div, (v // div) * div)
@@ -86,6 +119,7 @@ class UnifiedResizeImageMask:
     def apply_divisible(self, w, h, div, maintain_aspect):
         w = max(1, int(w))
         h = max(1, int(h))
+        div = max(1, int(round(div)))
 
         if div <= 1:
             return w, h
@@ -181,15 +215,16 @@ class UnifiedResizeImageMask:
         image=None,
         mask=None,
         scale_mode=None,
+        aspect_ratio="Auto (Input Image)",
         upscale_method="bilinear",
         crop="center",
-        divisible_by=32,
-        width=1024,
-        height=1024,
+        divisible_by=32.0,
+        width=1024.0,
+        height=1024.0,
         multiplier=1.0,
         megapixels=1.0,
-        long_side_target=1024,
-        short_side_target=768,
+        long_side_target=1024.0,
+        short_side_target=768.0,
         maintain_aspect=True
     ):
         if image is not None:
@@ -199,7 +234,8 @@ class UnifiedResizeImageMask:
             # No image connected: act as a plain resolution selector
             # (t2i / t2v use case). Aspect-dependent modes (Multiplier,
             # Longer/Shorter Side, MP) fall back to a square 1x1 source;
-            # use "Dimensions (W x H)" mode for exact width/height control.
+            # use "Dimensions (W x H)" mode for exact width/height control,
+            # or pick a preset from aspect_ratio to override the 1x1 fallback.
             orig_h = 1
             orig_w = 1
 
@@ -212,7 +248,14 @@ class UnifiedResizeImageMask:
             "short_side_target": short_side_target,
         }
 
-        w, h = self.resolve_size(scale_mode, orig_w, orig_h, kw)
+        # aspect_ratio is only meaningful for modes that derive width/height
+        # from a source aspect ratio; "Dimensions (W x H)" sets both values
+        # explicitly, so the preset is ignored there.
+        aspect_override = None
+        if scale_mode != "Dimensions (W × H)" and aspect_ratio in self.aspect_ratio_values:
+            aspect_override = self.aspect_ratio_values[aspect_ratio]
+
+        w, h = self.resolve_size(scale_mode, orig_w, orig_h, kw, aspect_override)
         w, h = self.apply_divisible(w, h, divisible_by, maintain_aspect)
         w, h = max(1, int(w)), max(1, int(h))
 
