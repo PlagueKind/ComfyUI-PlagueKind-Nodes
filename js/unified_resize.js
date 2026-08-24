@@ -73,9 +73,6 @@ app.registerExtension({
             divisible_by: "Divisible By",
         };
 
-        // aspect_ratio is only shown for modes that derive width/height from
-        // a source aspect ratio. "Dimensions (W x H)" sets both explicitly,
-        // so the preset dropdown doesn't apply there.
         const modeMap = {
             "Dimensions (W × H)": ["width", "height"],
                       "Multiplier": ["multiplier", "aspect_ratio"],
@@ -94,6 +91,15 @@ app.registerExtension({
             "aspect_ratio"
         ];
 
+        // Dimension widgets that should display as whole integers in the UI
+        const intDisplayWidgets = [
+            "width",
+            "height",
+            "long_side_target",
+            "short_side_target",
+            "divisible_by"
+        ];
+
         const origOnNodeCreated = nodeType.prototype.onNodeCreated;
 
         nodeType.prototype.onNodeCreated = function () {
@@ -104,6 +110,10 @@ app.registerExtension({
             const node = this;
 
             function applyVisibility() {
+                if (!node._all_inputs && node.inputs) {
+                    node._all_inputs = [...node.inputs];
+                }
+
                 const modeWidget = node.widgets?.find(w => w.name === "scale_mode");
 
                 if (!modeWidget) {
@@ -112,14 +122,40 @@ app.registerExtension({
 
                 const show = modeMap[modeWidget.value] || [];
 
+                // 1. Configure widget labels, formatting, and visibility
                 for (const w of node.widgets || []) {
                     if (LABELS[w.name]) {
                         w.label = LABELS[w.name];
                     }
 
+                    // Forces precision to 0 so integers display without decimals (.0)
+                    if (intDisplayWidgets.includes(w.name)) {
+                        w.options = w.options || {};
+                        w.options.precision = 0;
+                    }
+
                     if (dimensionWidgets.includes(w.name)) {
                         w.hidden = !show.includes(w.name);
                     }
+                }
+
+                // 2. Rebuild node.inputs so only active sockets exist in the graph
+                if (node._all_inputs) {
+                    for (let i = node.inputs.length - 1; i >= 0; i--) {
+                        const inp = node.inputs[i];
+                        if (dimensionWidgets.includes(inp.name) && !show.includes(inp.name)) {
+                            if (inp.link !== null) {
+                                node.disconnectInput(i);
+                            }
+                        }
+                    }
+
+                    node.inputs = node._all_inputs.filter(inp => {
+                        if (dimensionWidgets.includes(inp.name)) {
+                            return show.includes(inp.name);
+                        }
+                        return true;
+                    });
                 }
 
                 const computed = node.computeSize();

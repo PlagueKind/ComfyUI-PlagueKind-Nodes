@@ -51,8 +51,8 @@ class UnifiedResizeImageMask:
                 "short_side_target": ("FLOAT", {"default": 768.0, "min": 1.0, "max": 16384.0}),
                 "width": ("FLOAT", {"default": 1024.0, "min": 1.0, "max": 16384.0}),
                 "height": ("FLOAT", {"default": 1024.0, "min": 1.0, "max": 16384.0}),
-                "multiplier": ("FLOAT", {"default": 1.0}),
-                "megapixels": ("FLOAT", {"default": 1.0}),
+                "multiplier": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 100.0, "step": 0.01, "round": 0.01}),
+                "megapixels": ("FLOAT", {"default": 1.0, "min": 0.01, "max": 100.0, "step": 0.01, "round": 0.01}),
                 "upscale_method": (s.upscale_methods,),
                 "crop": (s.crop_methods,),
                 "divisible_by": ("FLOAT", {"default": 32.0, "min": 1.0, "max": 512.0}),
@@ -77,10 +77,6 @@ class UnifiedResizeImageMask:
         w = max(1.0, float(w))
         h = max(1.0, float(h))
 
-        # Aspect-driven modes (everything but explicit W x H) can have their
-        # source aspect ratio overridden by the aspect_ratio preset dropdown
-        # instead of being derived from the connected image (or the 1x1
-        # fallback when no image is connected).
         if aspect_override is not None:
             w, h = aspect_override
 
@@ -231,11 +227,6 @@ class UnifiedResizeImageMask:
             orig_h = image.shape[1]
             orig_w = image.shape[2]
         else:
-            # No image connected: act as a plain resolution selector
-            # (t2i / t2v use case). Aspect-dependent modes (Multiplier,
-            # Longer/Shorter Side, MP) fall back to a square 1x1 source;
-            # use "Dimensions (W x H)" mode for exact width/height control,
-            # or pick a preset from aspect_ratio to override the 1x1 fallback.
             orig_h = 1
             orig_w = 1
 
@@ -248,9 +239,6 @@ class UnifiedResizeImageMask:
             "short_side_target": short_side_target,
         }
 
-        # aspect_ratio is only meaningful for modes that derive width/height
-        # from a source aspect ratio; "Dimensions (W x H)" sets both values
-        # explicitly, so the preset is ignored there.
         aspect_override = None
         if scale_mode != "Dimensions (W × H)" and aspect_ratio in self.aspect_ratio_values:
             aspect_override = self.aspect_ratio_values[aspect_ratio]
