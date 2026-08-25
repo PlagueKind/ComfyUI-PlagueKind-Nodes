@@ -30,7 +30,7 @@ _H3_HEAD_DIM = 128
 _OK_DTYPES = (torch.bfloat16, torch.float16)
 
 # Dense-path backend candidates, tried in order. "pytorch" is a core
-# ComfyUI name. "ck" is ComfyUI's own "Comfy Kitchen" int8 backend
+# ComfyUI name. "comfy_kitchen" is ComfyUI's own "Comfy Kitchen" int8 backend
 # (--use-ck-attention), confirmed against comfy/ldm/modules/attention.py; the
 # extra entries are kept as harmless fallbacks in case a future version
 # renames it. "sage:*" modes are handled separately by _build_sage_dense_fn,
@@ -595,7 +595,7 @@ def _make_wrapper(state, sparsity_ratio, blkq, blkk, dense_last_steps,
 
 
 def patch_h3_sla(model, sparsity_ratio=0.90, block_size=64, min_seq_len=8192,
-                 dense_last_steps=0, protect_audio=True, dense_backend="ck",
+                 dense_last_steps=0, protect_audio=True, dense_backend="comfy_kitchen",
                  dense_steps="", disable_fp16_accum=True, stabilize_motion=False):
     """Return a clone of ``model`` whose H3 self-attention runs block-sparse.
 
@@ -604,7 +604,7 @@ def patch_h3_sla(model, sparsity_ratio=0.90, block_size=64, min_seq_len=8192,
 
     ``dense_backend`` pins every dense fall-through (short sequences,
     ``dense_last_steps``, and explicit ``dense_steps``) to a specific
-    attention kernel -- default "ck" (Comfy Kitchen int8), since it's fast
+    attention kernel -- default "comfy_kitchen" (Comfy Kitchen int8), since it's fast
     enough on the handful of dense steps this node runs to be worth its
     precision tradeoff there. "pytorch" pins the plain reference kernel
     instead if you want zero quantization anywhere in the dense path, at

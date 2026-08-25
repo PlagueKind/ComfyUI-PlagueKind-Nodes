@@ -17,7 +17,7 @@ log = logging.getLogger("H3Utils")
 BLOCK_SIZES = ("64", "128")
 # Matches kijai/ComfyUI-KJNodes' PatchSageAttentionKJ mode list exactly (see
 # sla/patch.py for the per-mode kernel + pv_accum_dtype each one calls),
-# plus this node's own "pytorch" / "ck" / "auto" choices.
+# plus this node's own "pytorch" / "comfy_kitchen" / "auto" choices.
 DENSE_BACKENDS = (
     "pytorch",
     "comfy_kitchen",
@@ -142,7 +142,7 @@ class H3SLAAttention(io.ComfyNode):
                     tooltip=(
                         "Attention kernel used on every dense fall-through "
                         "(short sequences, dense_last_steps, dense_steps). "
-                        "'ck' (default, Comfy Kitchen int8) is fast enough on "
+                        "'comfy_kitchen' (default, Comfy Kitchen int8) is fast enough on "
                         "the handful of dense steps this node runs to be "
                         "worth its precision tradeoff there. 'pytorch' pins "
                         "the plain reference kernel instead if you want zero "
