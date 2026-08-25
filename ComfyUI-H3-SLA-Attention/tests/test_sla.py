@@ -239,6 +239,24 @@ class StepWrapper(unittest.TestCase):
 @unittest.skipUnless(CUDA, "needs CUDA and triton")
 class Kernel(unittest.TestCase):
 
+    def test_motion_history_is_bounded_and_selected(self):
+        """Motion stabilization must not retain the complete per-layer LUT."""
+        from h3u.sla.block_map import get_block_map
+
+        S = 4096
+        torch.manual_seed(0)
+        q = torch.randn(1, S, H, D, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(1, S, H, D, device="cuda", dtype=torch.bfloat16)
+        lut, topk, history = get_block_map(
+            q, k, 0.15, 64, 64, return_history=True
+        )
+
+        self.assertEqual(history.shape[:-1], lut.shape[:-1])
+        self.assertLessEqual(history.shape[-1], 8)
+        self.assertLess(history.shape[-1], topk)
+        is_selected = (history.unsqueeze(-1) == lut.unsqueeze(-2)).any(dim=-1)
+        self.assertTrue(is_selected.all())
+
     def test_zero_sparsity_matches_dense_attention(self):
         """With every block kept, the sparse kernel is just attention."""
         from h3u.sla.block_map import get_block_map

@@ -184,9 +184,10 @@ class H3SLAAttention(io.ComfyNode):
                         "Bias each layer's block selection toward what it "
                         "picked last step, so a near-tie between two blocks "
                         "doesn't flip for no reason and show up as a faint "
-                        "double-exposure on fast motion. Costs essentially "
-                        "nothing, but it's a fix for that one specific "
-                        "symptom, not a general quality dial ")),
+                        "double-exposure on fast motion. Keeps a bounded set "
+                        "of near-cutoff block choices per layer; it is a fix "
+                        "for that one specific symptom, not a general quality "
+                        "dial.")),
             ],
             outputs=[io.Model.Output()],
         )

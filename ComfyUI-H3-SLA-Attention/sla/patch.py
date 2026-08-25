@@ -231,7 +231,7 @@ def _new_state():
         "failed": None,    # first kernel failure, if any
         "fp16_saved": None,     # (fp16, bf16) matmul reduction flags to restore
         "call_idx": 0,       # this step's call count, for stabilize_motion
-        "prev_lut": {},      # call_idx -> last sparse lut, for stabilize_motion
+        "prev_lut": {},      # call_idx -> bounded boundary LUT for motion stability
     }
 
 
@@ -248,6 +248,10 @@ def _reset_run_state(state):
     state["blocks"] = 0
     state["pinned"] = 0
     state["failed"] = None
+    state["call_idx"] = 0
+    # The history is generation-local. Besides preventing one video's block
+    # choices from biasing the next, clearing it releases retained GPU tensors.
+    state["prev_lut"].clear()
 
 
 def _summarise(state, sparsity, blkq, blkk):
@@ -285,13 +289,12 @@ def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
     is set globally; the sparse path is unaffected either way, since it
     never calls ``func`` at all.
 
-    ``stabilize_motion`` carries each layer's previously-selected key blocks
-    into ``get_block_map`` as a tie-breaker (see block_map.py); it costs one
-    small dict lookup and store per call, nothing else. ``state["call_idx"]``
-    is the layer identity this relies on -- it counts calls within the
-    current step, reset to 0 by the wrapper at the top of every step, and it
-    works because the model graph is static: the Nth attention call happens
-    in the same layer every step.
+    ``stabilize_motion`` carries a bounded set of each layer's near-cutoff key
+    blocks into ``get_block_map`` as a tie-breaker (see block_map.py).
+    ``state["call_idx"]`` is the layer identity this relies on -- it counts
+    calls within the current step, reset to 0 by the wrapper at the top of
+    every step, and it works because the model graph is static: the Nth
+    attention call happens in the same layer every step.
     """
     topk_ratio = 1.0 - sparsity_ratio
 
@@ -350,10 +353,18 @@ def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
             state["call_idx"] = call_idx + 1
             prev_lut = state["prev_lut"].get(call_idx) if stabilize_motion else None
 
-            lut, topk = get_block_map(qb, kb, topk_ratio, blkq, blkk,
-                                      protect_upto=prefix, prev_lut=prev_lut)
             if stabilize_motion:
-                state["prev_lut"][call_idx] = lut
+                lut, topk, history_lut = get_block_map(
+                    qb, kb, topk_ratio, blkq, blkk,
+                    protect_upto=prefix, prev_lut=prev_lut,
+                    return_history=True,
+                )
+                state["prev_lut"][call_idx] = history_lut
+            else:
+                lut, topk = get_block_map(
+                    qb, kb, topk_ratio, blkq, blkk,
+                    protect_upto=prefix,
+                )
             out = block_sparse_attention(qb, kb, vb, lut, topk, blkq, blkk)
 
             state["calls"] += 1
@@ -589,6 +600,9 @@ def _make_wrapper(state, sparsity_ratio, blkq, blkk, dense_last_steps,
                 if orig_bf16 is not None:
                     backend.allow_bf16_reduced_precision_reduction = orig_bf16
                 state["fp16_saved"] = None
+            # Do not retain GPU-resident motion history while ComfyUI is idle,
+            # and never carry one video's selections into the next video.
+            state["prev_lut"].clear()
         return out
 
     return wrapper

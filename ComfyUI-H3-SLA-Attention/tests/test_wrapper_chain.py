@@ -83,6 +83,36 @@ class WrapperExecutor:
 
 
 class WrapperChainRegression(unittest.TestCase):
+    def test_run_reset_clears_motion_history(self):
+        """GPU LUTs and choices from one video must not survive its run."""
+
+        state = sla_patch._new_state()
+        marker = object()
+        state["prev_lut"][0] = marker
+        state["call_idx"] = 17
+
+        sla_patch._reset_run_state(state)
+
+        self.assertEqual(state["prev_lut"], {})
+        self.assertEqual(state["call_idx"], 0)
+
+    def test_end_of_run_releases_motion_history(self):
+        """Release history immediately rather than waiting for another run."""
+
+        state = sla_patch._new_state()
+        state["prev_lut"][0] = object()
+        sla_wrapper = sla_patch._make_wrapper(state, 0.90, 64, 64, 0)
+        executor = WrapperExecutor(lambda *a, **k: None, [sla_wrapper])
+
+        executor.execute(
+            object(),
+            object(),
+            object(),
+            transformer_options={"sample_sigmas": [1.0, 0.0]},
+        )
+
+        self.assertEqual(state["prev_lut"], {})
+
     def test_sla_advances_to_downstream_wrapper_before_original(self):
         events = []
         state = sla_patch._new_state()
