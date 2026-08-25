@@ -239,6 +239,24 @@ class StepWrapper(unittest.TestCase):
 @unittest.skipUnless(CUDA, "needs CUDA and triton")
 class Kernel(unittest.TestCase):
 
+    def test_motion_history_is_bounded_and_selected(self):
+        """Motion stabilization must not retain the complete per-layer LUT."""
+        from h3u.sla.block_map import get_block_map
+
+        S = 4096
+        torch.manual_seed(0)
+        q = torch.randn(1, S, H, D, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(1, S, H, D, device="cuda", dtype=torch.bfloat16)
+        lut, topk, history = get_block_map(
+            q, k, 0.15, 64, 64, return_history=True
+        )
+
+        self.assertEqual(history.shape[:-1], lut.shape[:-1])
+        self.assertLessEqual(history.shape[-1], 8)
+        self.assertLess(history.shape[-1], topk)
+        is_selected = (history.unsqueeze(-1) == lut.unsqueeze(-2)).any(dim=-1)
+        self.assertTrue(is_selected.all())
+
     def test_zero_sparsity_matches_dense_attention(self):
         """With every block kept, the sparse kernel is just attention."""
         from h3u.sla.block_map import get_block_map
@@ -295,6 +313,31 @@ class Kernel(unittest.TestCase):
         got = lut.long().sort(dim=-1).values[..., :n_pinned]
         want = torch.arange(n_pinned, device=lut.device)
         self.assertTrue(torch.equal(got, want.expand_as(got)))
+
+    def test_audio_range_does_not_pin_conditioning_prefix(self):
+        """Protect audio precisely instead of force-selecting refs before it."""
+        from h3u.sla.block_map import get_block_map
+
+        S = 16384
+        audio_start, audio_stop = 4096, 6144
+        torch.manual_seed(0)
+        q = torch.randn(1, S, H, D, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(1, S, H, D, device="cuda", dtype=torch.bfloat16)
+        lut, _ = get_block_map(
+            q, k, 0.05, 128, 64,
+            protect_ranges=((audio_start, audio_stop),),
+        )
+
+        first_audio = audio_start // 64
+        last_audio = audio_stop // 64
+        audio_blocks = torch.arange(first_audio, last_audio, device=lut.device)
+        has_audio = (lut.unsqueeze(-1).long() == audio_blocks).any(dim=-2)
+        self.assertTrue(has_audio.all(), "an audio block was not protected")
+
+        # There are more conditioning-prefix blocks than non-audio slots in
+        # this deliberately small top-k, so the full prefix cannot be pinned.
+        prefix_coverage = (lut.long() < first_audio).sum(dim=-1)
+        self.assertLess(prefix_coverage.max().item(), first_audio)
 
     def test_pinning_selects_the_same_blocks_at_zero_sparsity(self):
         """Pinning must decide *which* blocks, never alter their values.

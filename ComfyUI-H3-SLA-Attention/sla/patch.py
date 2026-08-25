@@ -21,7 +21,7 @@ import logging
 
 import torch
 
-from .block_map import get_block_map
+from .block_map import get_block_map, get_protected_block_ranges
 from .kernel import block_sparse_attention
 
 log = logging.getLogger("H3Utils")
@@ -231,7 +231,7 @@ def _new_state():
         "failed": None,    # first kernel failure, if any
         "fp16_saved": None,     # (fp16, bf16) matmul reduction flags to restore
         "call_idx": 0,       # this step's call count, for stabilize_motion
-        "prev_lut": {},      # call_idx -> last sparse lut, for stabilize_motion
+        "prev_lut": {},      # call_idx -> bounded boundary LUT for motion stability
     }
 
 
@@ -248,6 +248,10 @@ def _reset_run_state(state):
     state["blocks"] = 0
     state["pinned"] = 0
     state["failed"] = None
+    state["call_idx"] = 0
+    # The history is generation-local.  Besides preventing one video's block
+    # choices from biasing the next, clearing it releases retained GPU tensors.
+    state["prev_lut"].clear()
 
 
 def _summarise(state, sparsity, blkq, blkk):
@@ -285,13 +289,12 @@ def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
     is set globally; the sparse path is unaffected either way, since it
     never calls ``func`` at all.
 
-    ``stabilize_motion`` carries each layer's previously-selected key blocks
-    into ``get_block_map`` as a tie-breaker (see block_map.py); it costs one
-    small dict lookup and store per call, nothing else. ``state["call_idx"]``
-    is the layer identity this relies on -- it counts calls within the
-    current step, reset to 0 by the wrapper at the top of every step, and it
-    works because the model graph is static: the Nth attention call happens
-    in the same layer every step.
+    ``stabilize_motion`` carries a bounded set of each layer's near-cutoff key
+    blocks into ``get_block_map`` as a tie-breaker (see block_map.py).
+    ``state["call_idx"]`` is the layer identity this relies on -- it counts
+    calls within the current step, reset to 0 by the wrapper at the top of
+    every step, and it works because the model graph is static: the Nth
+    attention call happens in the same layer every step.
     """
     topk_ratio = 1.0 - sparsity_ratio
 
@@ -337,12 +340,16 @@ def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
             if not qb.is_contiguous():
                 qb, kb, vb = qb.contiguous(), kb.contiguous(), vb.contiguous()
 
-            # Pin the [text | cond | audio] prefix into every query's
-            # selection. Audio is ~1% of the packed sequence, so plain top-k
-            # routinely drops all of it and the soundtrack degrades while the
-            # video stays fine. 0 when the layout is unavailable, which simply
-            # disables the protection rather than guessing.
-            prefix = int(to.get("_h3sla_prefix", 0) or 0) if protect_audio else 0
+            # Pin audio into every query's selection. New wrappers provide its
+            # precise token ranges so reference images are not accidentally
+            # force-selected too. The prefix value is a compatibility fallback
+            # for transformer_options produced by older wrappers.
+            protected_ranges = None
+            prefix = 0
+            if protect_audio:
+                protected_ranges = to.get("_h3sla_protected_ranges")
+                if protected_ranges is None:
+                    prefix = int(to.get("_h3sla_prefix", 0) or 0)
             if prefix >= S:
                 prefix = 0
 
@@ -350,17 +357,31 @@ def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
             state["call_idx"] = call_idx + 1
             prev_lut = state["prev_lut"].get(call_idx) if stabilize_motion else None
 
-            lut, topk = get_block_map(qb, kb, topk_ratio, blkq, blkk,
-                                      protect_upto=prefix, prev_lut=prev_lut)
             if stabilize_motion:
-                state["prev_lut"][call_idx] = lut
+                lut, topk, history_lut = get_block_map(
+                    qb, kb, topk_ratio, blkq, blkk,
+                    protect_upto=prefix, prev_lut=prev_lut,
+                    protect_ranges=protected_ranges,
+                    return_history=True,
+                )
+                state["prev_lut"][call_idx] = history_lut
+            else:
+                lut, topk = get_block_map(
+                    qb, kb, topk_ratio, blkq, blkk,
+                    protect_upto=prefix,
+                    protect_ranges=protected_ranges,
+                )
             out = block_sparse_attention(qb, kb, vb, lut, topk, blkq, blkk)
 
             state["calls"] += 1
             state["seq"] = S
             state["kept"] = topk
             state["blocks"] = (S + blkk - 1) // blkk
-            state["pinned"] = (prefix + blkk - 1) // blkk
+            state["pinned"] = sum(
+                last - first for first, last in get_protected_block_ranges(
+                    prefix, protected_ranges, blkk, state["blocks"]
+                )
+            )
 
             # [1, S, H, D] -> what the caller expects
             if skip_output_reshape:
@@ -545,17 +566,22 @@ def _make_wrapper(state, sparsity_ratio, blkq, blkk, dense_last_steps,
             _set_fp16_accum(False)
 
         # PackedLayout.segments is [(start, stop, kind), ...] over
-        # [text | cond/ref | audio | video]; the video start is therefore the
-        # length of everything that must stay exactly attended. It lives on the
-        # payload, which never reaches the attention call site, so the wrapper
-        # is the only place it can be picked up.
+        # [text | cond/ref | audio | video]. Preserve the historical prefix for
+        # compatibility and also pass precise audio spans so protect_audio no
+        # longer force-selects high-resolution reference-image tokens.
         prefix = 0
+        audio_ranges = []
         layout = minimax_payload.get("layout") if minimax_payload else None
         for seg in getattr(layout, "segments", ()) or ():
-            if len(seg) == 3 and seg[2] == "video":
-                prefix = int(seg[0])
-                break
+            if len(seg) != 3:
+                continue
+            start, stop, kind = seg
+            if kind == "audio":
+                audio_ranges.append((int(start), int(stop)))
+            elif kind == "video" and prefix == 0:
+                prefix = int(start)
         to["_h3sla_prefix"] = prefix
+        to["_h3sla_protected_ranges"] = tuple(audio_ranges)
 
         step0 = state["step"] - 1  # 0-based, for dense_steps membership
         to["_h3sla_dense"] = bool(
@@ -589,6 +615,9 @@ def _make_wrapper(state, sparsity_ratio, blkq, blkk, dense_last_steps,
                 if orig_bf16 is not None:
                     backend.allow_bf16_reduced_precision_reduction = orig_bf16
                 state["fp16_saved"] = None
+            # Do not retain GPU-resident motion history while ComfyUI is idle,
+            # and never carry one video's selections into the next video.
+            state["prev_lut"].clear()
         return out
 
     return wrapper

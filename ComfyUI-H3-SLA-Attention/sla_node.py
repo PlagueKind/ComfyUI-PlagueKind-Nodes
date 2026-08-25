@@ -111,13 +111,14 @@ class H3SLAAttention(io.ComfyNode):
                     label_on="protect", label_off="uniform (lightx2v parity)",
                     optional=True,
                     tooltip=(
-                        "Always attend the [text | cond | audio] prefix, "
-                        "whatever top-k picks. Audio is about 1% of the packed "
-                        "sequence -- 19 key blocks of 1794 at 768p/15s -- so "
-                        "plain top-k regularly drops all of it and the "
-                        "soundtrack degrades while the video still looks fine. "
-                        "Costs roughly 7%. Turn off only to reproduce "
-                        "lightx2v's uniform selection exactly.")),
+                        "Always attend blocks overlapping actual audio "
+                        "segments, whatever top-k picks. Reference-image and "
+                        "text/conditioning blocks are not force-selected. "
+                        "Audio is about 1% of the packed sequence -- 19 key "
+                        "blocks of 1794 at 768p/15s -- so plain top-k can drop "
+                        "all of it while the video still looks fine. Turn off "
+                        "only to reproduce lightx2v's uniform selection "
+                        "exactly.")),
                 io.Boolean.Input("enabled", default=True,
                     label_on="sparse", label_off="dense (bypass)",
                     optional=True,
@@ -184,9 +185,10 @@ class H3SLAAttention(io.ComfyNode):
                         "Bias each layer's block selection toward what it "
                         "picked last step, so a near-tie between two blocks "
                         "doesn't flip for no reason and show up as a faint "
-                        "double-exposure on fast motion. Costs essentially "
-                        "nothing, but it's a fix for that one specific "
-                        "symptom, not a general quality dial ")),
+                        "double-exposure on fast motion. Keeps a bounded set "
+                        "of near-cutoff block choices per layer; it is a fix "
+                        "for that one specific symptom, not a general quality "
+                        "dial.")),
             ],
             outputs=[io.Model.Output()],
         )

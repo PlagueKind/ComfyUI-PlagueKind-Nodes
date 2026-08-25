@@ -40,6 +40,7 @@ def _load_patch_module():
     block_map.get_block_map = lambda *args, **kwargs: (_ for _ in ()).throw(
         AssertionError("attention routing is outside this wrapper-chain test")
     )
+    block_map.get_protected_block_ranges = lambda *args, **kwargs: ()
     sys.modules[block_map.__name__] = block_map
 
     kernel = types.ModuleType(f"{_PACKAGE}.sla.kernel")
@@ -83,6 +84,36 @@ class WrapperExecutor:
 
 
 class WrapperChainRegression(unittest.TestCase):
+    def test_run_reset_clears_motion_history(self):
+        """GPU LUTs and choices from one video must not survive its run."""
+
+        state = sla_patch._new_state()
+        marker = object()
+        state["prev_lut"][0] = marker
+        state["call_idx"] = 17
+
+        sla_patch._reset_run_state(state)
+
+        self.assertEqual(state["prev_lut"], {})
+        self.assertEqual(state["call_idx"], 0)
+
+    def test_end_of_run_releases_motion_history(self):
+        """Release history immediately rather than waiting for another run."""
+
+        state = sla_patch._new_state()
+        state["prev_lut"][0] = object()
+        sla_wrapper = sla_patch._make_wrapper(state, 0.90, 64, 64, 0)
+        executor = WrapperExecutor(lambda *a, **k: None, [sla_wrapper])
+
+        executor.execute(
+            object(),
+            object(),
+            object(),
+            transformer_options={"sample_sigmas": [1.0, 0.0]},
+        )
+
+        self.assertEqual(state["prev_lut"], {})
+
     def test_sla_advances_to_downstream_wrapper_before_original(self):
         events = []
         state = sla_patch._new_state()
@@ -134,6 +165,35 @@ class WrapperChainRegression(unittest.TestCase):
         )
 
         self.assertIs(seen["minimax_payload"], payload)
+
+    def test_audio_range_is_read_without_pinning_reference_segments(self):
+        state = sla_patch._new_state()
+        sla_wrapper = sla_patch._make_wrapper(state, 0.90, 64, 64, 0)
+        seen = {}
+
+        class Layout:
+            segments = [
+                (0, 512, "text"),
+                (512, 8192, "cond"),
+                (8192, 10192, "audio"),
+                (10192, 120000, "video"),
+            ]
+
+        def downstream(executor, *args, **kwargs):
+            seen.update(kwargs["transformer_options"])
+            return executor(*args, **kwargs)
+
+        executor = WrapperExecutor(
+            lambda *a, **k: None, [sla_wrapper, downstream]
+        )
+        executor.execute(
+            object(), object(), object(),
+            transformer_options={"sample_sigmas": [1.0, 0.0]},
+            minimax_payload={"layout": Layout()},
+        )
+
+        self.assertEqual(seen["_h3sla_protected_ranges"], ((8192, 10192),))
+        self.assertEqual(seen["_h3sla_prefix"], 10192)
 
     def test_spectrum_forecasts_do_not_merge_sla_run_state(self):
         """Skipped NFEs must not make SLA count across independent sampler runs."""
