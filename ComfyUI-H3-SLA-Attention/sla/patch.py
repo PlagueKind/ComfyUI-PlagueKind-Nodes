@@ -248,6 +248,11 @@ def _reset_run_state(state):
     state["blocks"] = 0
     state["pinned"] = 0
     state["failed"] = None
+    # Catches the case the end-of-run clear (in the wrapper) can't: a
+    # generation that got cancelled mid-run never reaches that clear, so
+    # stabilize_motion's held tensors from the abandoned run would otherwise
+    # sit in VRAM until this next-run detection fires here.
+    state["prev_lut"].clear()
 
 
 def _summarise(state, sparsity, blkq, blkk):
@@ -350,10 +355,18 @@ def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
             state["call_idx"] = call_idx + 1
             prev_lut = state["prev_lut"].get(call_idx) if stabilize_motion else None
 
-            lut, topk = get_block_map(qb, kb, topk_ratio, blkq, blkk,
-                                      protect_upto=prefix, prev_lut=prev_lut)
             if stabilize_motion:
-                state["prev_lut"][call_idx] = lut
+                lut, topk, history = get_block_map(
+                    qb, kb, topk_ratio, blkq, blkk,
+                    protect_upto=prefix, prev_lut=prev_lut, return_history=True,
+                )
+                # Only the bounded boundary slice is retained -- see
+                # block_map.py. Storing the full lut here is what made this
+                # grow to several GB per run at 768p with stabilize_motion on.
+                state["prev_lut"][call_idx] = history
+            else:
+                lut, topk = get_block_map(qb, kb, topk_ratio, blkq, blkk,
+                                          protect_upto=prefix, prev_lut=prev_lut)
             out = block_sparse_attention(qb, kb, vb, lut, topk, blkq, blkk)
 
             state["calls"] += 1
@@ -569,18 +582,38 @@ def _make_wrapper(state, sparsity_ratio, blkq, blkk, dense_last_steps,
         # crash mid-sampling rather than the graceful no-op they should get.
         if minimax_payload is not None:
             kwargs["minimax_payload"] = minimax_payload
-        out = _call_next_wrapper(
-            executor,
-            x,
-            timestep,
-            context,
-            transformer_options=transformer_options,
-            **kwargs,
-        )
+        try:
+            out = _call_next_wrapper(
+                executor,
+                x,
+                timestep,
+                context,
+                transformer_options=transformer_options,
+                **kwargs,
+            )
+        except Exception:
+            # This run is dead regardless of cause -- most commonly OOM.
+            # stabilize_motion's held tensors must not survive to poison
+            # the *next* attempt with the same already-scarce VRAM.
+            # _reset_run_state only clears them lazily, once a new run's
+            # first step is detected -- which never happens if the caller
+            # does not retry with this same patched clone. Cleared here,
+            # unconditionally, before the exception reaches ComfyUI.
+            state["prev_lut"].clear()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            raise
 
         if state["step"] >= n_steps and not state["summarized"]:
             _summarise(state, sparsity_ratio, blkq, blkk)
             state["summarized"] = True
+            # stabilize_motion's prev_lut only needs to survive step-to-step
+            # within this run -- the whole point is comparing against *last
+            # step*, not some earlier generation. Left unset it would sit on
+            # its held tensors (one per layer, bounded, but real: same order
+            # as a large activation) in VRAM for as long as this patched
+            # model stays cached, doing nothing between separate runs.
+            state["prev_lut"].clear()
             if disable_fp16_accum and state["fp16_saved"] is not None:
                 orig_fp16, orig_bf16 = state["fp16_saved"]
                 backend = torch.backends.cuda.matmul

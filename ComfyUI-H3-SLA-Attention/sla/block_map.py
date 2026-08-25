@@ -88,10 +88,17 @@ def mean_pool(x, BLK):
 # still wins, big enough to kill a near-tie flip between steps that isn't
 # telling you anything real.
 _STICKY_BONUS_FRAC = 0.05
+# Only selections near the top-k cutoff can realistically flip on the next
+# step. Retaining the complete LUT for all 50 H3 layers makes stabilization
+# state scale as O(NQ * topk) -- several GB at 768p -- for a nudge that only
+# ever matters at the boundary. Eight boundary entries per query row keep
+# the intended hysteresis while making the retained state O(NQ) with a
+# small constant.
+_STICKY_HISTORY_WIDTH = 8
 
 
 def get_block_map(q, k, topk_ratio, BLKQ=128, BLKK=128, protect_upto=0,
-                  prev_lut=None):
+                  prev_lut=None, return_history=False):
     """Return ``(lut, topk)``: the key blocks each query block should attend to.
 
     ``q``/``k`` are ``(B, L, H, D)`` contiguous. ``lut`` comes back as
@@ -150,6 +157,24 @@ def get_block_map(q, k, topk_ratio, BLKQ=128, BLKK=128, protect_upto=0,
             pooled_score[..., :n_pinned] = float("inf")
             topk = min(NK, topk + n_pinned)
 
-    lut = torch.topk(pooled_score, topk, dim=-1, sorted=False).indices
+    selected = torch.topk(pooled_score, topk, dim=-1, sorted=False)
+    lut = selected.indices
+    lut_i32 = lut.to(torch.int32).contiguous()
 
-    return lut.to(torch.int32).contiguous(), topk
+    if not return_history:
+        return lut_i32, topk
+
+    # Bound what stabilize_motion carries into the next step to the
+    # entries nearest the cutoff -- the only ones that can plausibly flip.
+    # Strong selections do not need a sticky bonus, so dropping them from
+    # the retained history costs nothing but the VRAM they were sitting on.
+    history_width = min(_STICKY_HISTORY_WIDTH, topk)
+    if history_width == topk:
+        history = lut
+    else:
+        boundary_pos = torch.topk(
+            selected.values, history_width, dim=-1, largest=False, sorted=False
+        ).indices
+        history = torch.gather(lut, -1, boundary_pos)
+
+    return lut_i32, topk, history.to(torch.int32).contiguous()
