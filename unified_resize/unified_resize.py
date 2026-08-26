@@ -1,6 +1,18 @@
 import math
 import torch
 import comfy.utils
+
+
+def srgb_to_linear(x):
+    x = x.clamp(0.0, 1.0)
+    return torch.where(x <= 0.04045, x / 12.92,
+                       ((x.clamp(min=0.04045) + 0.055) / 1.055) ** 2.4)
+
+
+def linear_to_srgb(x):
+    x = x.clamp(0.0, 1.0)
+    return torch.where(x <= 0.0031308, x * 12.92,
+                       1.055 * x.clamp(min=0.0031308) ** (1.0 / 2.4) - 0.055)
 import torch.nn.functional as F
 
 
@@ -136,6 +148,7 @@ class UnifiedResizeImageMask:
 
     def resize_image(self, x, target_w, target_h, method, crop_mode):
         x = x.movedim(-1, 1)
+        x = srgb_to_linear(x)
 
         if crop_mode == "center":
             ow = x.shape[3]
@@ -170,6 +183,7 @@ class UnifiedResizeImageMask:
                 False
             )
 
+        x = linear_to_srgb(x)
         return x.movedim(1, -1)
 
     def resize_mask(self, mask, target_w, target_h, crop_mode):
