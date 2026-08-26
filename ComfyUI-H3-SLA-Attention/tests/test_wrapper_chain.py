@@ -40,6 +40,7 @@ def _load_patch_module():
     block_map.get_block_map = lambda *args, **kwargs: (_ for _ in ()).throw(
         AssertionError("attention routing is outside this wrapper-chain test")
     )
+    block_map.get_protected_block_ranges = lambda *args, **kwargs: ()
     sys.modules[block_map.__name__] = block_map
 
     kernel = types.ModuleType(f"{_PACKAGE}.sla.kernel")
@@ -83,6 +84,80 @@ class WrapperExecutor:
 
 
 class WrapperChainRegression(unittest.TestCase):
+    def test_reference_modes_resolve_to_fixed_sparsity(self):
+        self.assertEqual(
+            sla_patch._resolve_reference_sparsity("True"),
+            ("true", 0.0),
+        )
+        self.assertEqual(
+            sla_patch._resolve_reference_sparsity("Light"),
+            ("light", 0.85),
+        )
+        self.assertEqual(
+            sla_patch._resolve_reference_sparsity("Off"),
+            ("off", None),
+        )
+        # Experimental Manual workflows migrate to the audited fixed preset.
+        self.assertEqual(
+            sla_patch._resolve_reference_sparsity("Manual"),
+            ("light", 0.85),
+        )
+
+    def test_audio_protection_is_boolean_with_safe_string_migration(self):
+        self.assertTrue(sla_patch._resolve_audio_protection(True))
+        self.assertFalse(sla_patch._resolve_audio_protection(False))
+        self.assertTrue(sla_patch._resolve_audio_protection("True"))
+        self.assertFalse(sla_patch._resolve_audio_protection("Off"))
+        # A workflow saved while PR #1 exposed Manual becomes fully protected.
+        self.assertTrue(sla_patch._resolve_audio_protection("Manual"))
+        self.assertEqual(
+            sla_patch._resolve_audio_protection("false"),
+            False,
+        )
+
+    def test_language_and_audio_ranges_exclude_visual_reference_segments(self):
+        state = sla_patch._new_state()
+        sla_wrapper = sla_patch._make_wrapper(
+            state, 0.90, 64, 64, 0, reference_quota_enabled=True
+        )
+        seen = {}
+
+        class Layout:
+            segments = [
+                (0, 512, "text"),
+                (512, 8192, "ref_img"),
+                (8192, 9192, "ref_audio"),
+                (9192, 11192, "audio"),
+                (11192, 120000, "video"),
+            ]
+
+        def downstream(executor, *args, **kwargs):
+            seen.update(kwargs["transformer_options"])
+            return executor(*args, **kwargs)
+
+        executor = WrapperExecutor(
+            lambda *a, **k: None, [sla_wrapper, downstream]
+        )
+        executor.execute(
+            object(), object(), object(),
+            transformer_options={"sample_sigmas": [1.0, 0.0]},
+            minimax_payload={
+                "layout": Layout(),
+                "text_token_tags": [1] * 64 + [0] * 416 + [1] * 32,
+            },
+        )
+
+        self.assertEqual(
+            seen["_h3sla_protected_ranges"],
+            ((0, 64), (480, 512), (8192, 9192), (9192, 11192)),
+        )
+        self.assertEqual(
+            seen["_h3sla_reference_ranges"],
+            ((64, 480), (512, 8192)),
+        )
+        self.assertEqual(seen["_h3sla_prefix"], 11192)
+        self.assertEqual(seen["_h3sla_stabilize_query_from"], 11192)
+
     def test_sla_advances_to_downstream_wrapper_before_original(self):
         events = []
         state = sla_patch._new_state()

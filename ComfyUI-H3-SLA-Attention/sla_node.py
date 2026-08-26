@@ -15,6 +15,7 @@ from comfy_api.latest import io
 log = logging.getLogger("H3Utils")
 
 BLOCK_SIZES = ("64", "128")
+REFERENCE_PROTECTION_MODES = ("True", "Light", "Off")
 # Matches kijai/ComfyUI-KJNodes' PatchSageAttentionKJ mode list exactly (see
 # sla/patch.py for the per-mode kernel + pv_accum_dtype each one calls),
 # plus this node's own "pytorch" / "comfy_kitchen" / "auto" choices.
@@ -111,13 +112,12 @@ class H3SLAAttention(io.ComfyNode):
                     label_on="protect", label_off="uniform (lightx2v parity)",
                     optional=True,
                     tooltip=(
-                        "Always attend the [text | cond | audio] prefix, "
-                        "whatever top-k picks. Audio is about 1% of the packed "
-                        "sequence -- 19 key blocks of 1794 at 768p/15s -- so "
-                        "plain top-k regularly drops all of it and the "
-                        "soundtrack degrades while the video still looks fine. "
-                        "Costs roughly 7%. Turn off only to reproduce "
-                        "lightx2v's uniform selection exactly.")),
+                        "Always attend blocks overlapping actual language "
+                        "tokens, target audio, and audio-reference segments. "
+                        "Visual-reference blocks are controlled separately. "
+                        "Disable only for LightX2V-style uniform sparsity; "
+                        "testing found partial or unprotected audio unstable "
+                        "for very little speed gain.")),
                 io.Boolean.Input("enabled", default=True,
                     label_on="sparse", label_off="dense (bypass)",
                     optional=True,
@@ -184,9 +184,24 @@ class H3SLAAttention(io.ComfyNode):
                         "Bias each layer's block selection toward what it "
                         "picked last step, so a near-tie between two blocks "
                         "doesn't flip for no reason and show up as a faint "
-                        "double-exposure on fast motion. Costs essentially "
-                        "nothing, but it's a fix for that one specific "
-                        "symptom, not a general quality dial ")),
+                        "double-exposure on fast motion. Only target-video "
+                        "query rows are stabilized; text and audio choices "
+                        "remain step-local. It is a fix for that one specific "
+                        "symptom, not a general quality dial.")),
+                io.Combo.Input("reference_protection",
+                    options=list(REFERENCE_PROTECTION_MODES), default="Off",
+                    optional=True,
+                    tooltip=(
+                        "Protect Image/Video Reference. True guarantees every "
+                        "Qwen vision-token, conditioning/image-reference, and "
+                        "video-reference block, "
+                        "matching the broad legacy prefix protection. Light "
+                        "uses fixed 0.85 reference sparsity and guarantees the "
+                        "best-scoring 15% of each visual-reference range. Off "
+                        "adds no special quota; "
+                        "references still participate in ordinary top-k. "
+                        "Default Off preserves the precise audio patch's "
+                        "fastest behaviour.")),
             ],
             outputs=[io.Model.Output()],
         )
@@ -195,7 +210,8 @@ class H3SLAAttention(io.ComfyNode):
     def execute(cls, model, sparsity_ratio=0.90, block_size="64",
                 min_seq_len=4096, dense_last_steps=1, protect_audio=True,
                 enabled=True, dense_steps="0", dense_backend="comfy_kitchen",
-                disable_fp16_accum=True, stabilize_motion=True) -> io.NodeOutput:
+                disable_fp16_accum=True, stabilize_motion=True,
+                reference_protection="Off") -> io.NodeOutput:
         if not enabled:
             log.info("[H3Utils] SLA disabled; model passed through unchanged.")
             return io.NodeOutput(model)
@@ -213,6 +229,7 @@ class H3SLAAttention(io.ComfyNode):
                 disable_fp16_accum=disable_fp16_accum,
                 protect_audio=protect_audio,
                 stabilize_motion=stabilize_motion,
+                reference_protection=reference_protection,
             )
         except Exception:                                # noqa: BLE001
             # Triton missing, an incompatible GPU, a ComfyUI API change -- none
