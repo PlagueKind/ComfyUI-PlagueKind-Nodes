@@ -239,6 +239,47 @@ class StepWrapper(unittest.TestCase):
 @unittest.skipUnless(CUDA, "needs CUDA and triton")
 class Kernel(unittest.TestCase):
 
+    def test_light_reference_quota_guarantees_scored_reference_blocks(self):
+        from h3u.sla.block_map import get_block_map
+
+        S = 4096
+        reference = (512, 1536)  # 16 key blocks at BLKK=64
+        torch.manual_seed(0)
+        q = torch.randn(1, S, H, D, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(1, S, H, D, device="cuda", dtype=torch.bfloat16)
+
+        _, plain_topk = get_block_map(q, k, 0.10, 64, 64)
+        lut, topk = get_block_map(
+            q, k, 0.10, 64, 64,
+            reference_ranges=(reference,),
+            reference_sparsity=0.85,
+        )
+
+        # ceil(15% of 16) = 3, added without displacing the global top-k.
+        self.assertEqual(topk, plain_topk + 3)
+        first, last = reference[0] // 64, reference[1] // 64
+        reference_count = ((lut.long() >= first) & (lut.long() < last)).sum(-1)
+        self.assertTrue((reference_count >= 3).all())
+
+    def test_motion_history_excludes_nonvideo_query_rows(self):
+        """Text/audio queries must not inherit motion choices between steps."""
+        from h3u.sla.block_map import get_block_map
+
+        S = 4096
+        video_start = 1024
+        torch.manual_seed(0)
+        q = torch.randn(1, S, H, D, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(1, S, H, D, device="cuda", dtype=torch.bfloat16)
+        lut, _, history = get_block_map(
+            q, k, 0.15, 64, 64, return_history=True,
+            stabilize_query_from=video_start,
+        )
+
+        first_video_query = (video_start + 63) // 64
+        self.assertEqual(
+            history.shape[-2], lut.shape[-2] - first_video_query
+        )
+
     def test_zero_sparsity_matches_dense_attention(self):
         """With every block kept, the sparse kernel is just attention."""
         from h3u.sla.block_map import get_block_map
@@ -295,6 +336,31 @@ class Kernel(unittest.TestCase):
         got = lut.long().sort(dim=-1).values[..., :n_pinned]
         want = torch.arange(n_pinned, device=lut.device)
         self.assertTrue(torch.equal(got, want.expand_as(got)))
+
+    def test_audio_range_does_not_pin_conditioning_prefix(self):
+        """Protect audio precisely instead of force-selecting refs before it."""
+        from h3u.sla.block_map import get_block_map
+
+        S = 16384
+        audio_start, audio_stop = 4096, 6144
+        torch.manual_seed(0)
+        q = torch.randn(1, S, H, D, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(1, S, H, D, device="cuda", dtype=torch.bfloat16)
+        lut, _ = get_block_map(
+            q, k, 0.05, 128, 64,
+            protect_ranges=((audio_start, audio_stop),),
+        )
+
+        first_audio = audio_start // 64
+        last_audio = audio_stop // 64
+        audio_blocks = torch.arange(first_audio, last_audio, device=lut.device)
+        has_audio = (lut.unsqueeze(-1).long() == audio_blocks).any(dim=-2)
+        self.assertTrue(has_audio.all(), "an audio block was not protected")
+
+        # There are more conditioning-prefix blocks than non-audio slots in
+        # this deliberately small top-k, so the full prefix cannot be pinned.
+        prefix_coverage = (lut.long() < first_audio).sum(dim=-1)
+        self.assertLess(prefix_coverage.max().item(), first_audio)
 
     def test_pinning_selects_the_same_blocks_at_zero_sparsity(self):
         """Pinning must decide *which* blocks, never alter their values.

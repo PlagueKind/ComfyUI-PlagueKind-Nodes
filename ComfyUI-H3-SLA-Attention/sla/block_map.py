@@ -27,6 +27,8 @@ Three changes against upstream, marked FIX:
 
 from __future__ import annotations
 
+import math
+
 import torch
 import triton
 import triton.language as tl
@@ -97,8 +99,83 @@ _STICKY_BONUS_FRAC = 0.05
 _STICKY_HISTORY_WIDTH = 8
 
 
+def get_protected_block_ranges(protect_upto, protect_ranges, BLKK, NK):
+    """Return merged half-open key-block ranges that must always be selected.
+
+    ``protect_upto`` keeps compatibility with the original prefix-only API.
+    ``protect_ranges`` permits precise token spans, notably H3's audio segment,
+    without force-selecting intervening text or reference-image tokens.
+    """
+    token_ranges = []
+    if protect_upto > 0:
+        token_ranges.append((0, int(protect_upto)))
+    for item in protect_ranges or ():
+        try:
+            start, stop = int(item[0]), int(item[1])
+        except (IndexError, TypeError, ValueError):
+            continue
+        if stop <= start:
+            continue
+        token_ranges.append((max(0, start), max(0, stop)))
+
+    block_ranges = []
+    for start, stop in token_ranges:
+        first = min(NK, start // BLKK)
+        last = min(NK, (stop + BLKK - 1) // BLKK)
+        if first < last:
+            block_ranges.append((first, last))
+
+    merged = []
+    for first, last in sorted(block_ranges):
+        if merged and first <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], last))
+        else:
+            merged.append((first, last))
+    return tuple(merged)
+
+
+def get_reference_quota_block_ranges(reference_ranges, protect_upto,
+                                     protected_ranges, BLKK, NK):
+    """Return reference block ranges excluding blocks already fully pinned.
+
+    Token spans are rounded out to key-block boundaries. Any overlap with the
+    language/audio protection is subtracted so the optional reference quota
+    never pays for, or counts, a block that is already guaranteed.
+    """
+    references = get_protected_block_ranges(0, reference_ranges, BLKK, NK)
+    protected = get_protected_block_ranges(
+        protect_upto, protected_ranges, BLKK, NK
+    )
+    available = []
+    for first, last in references:
+        pieces = [(first, last)]
+        for protected_first, protected_last in protected:
+            next_pieces = []
+            for piece_first, piece_last in pieces:
+                if protected_last <= piece_first or protected_first >= piece_last:
+                    next_pieces.append((piece_first, piece_last))
+                    continue
+                if piece_first < protected_first:
+                    next_pieces.append((piece_first, protected_first))
+                if protected_last < piece_last:
+                    next_pieces.append((protected_last, piece_last))
+            pieces = next_pieces
+        available.extend(pieces)
+    return tuple(available)
+
+
+def get_reference_quota_keep_count(block_count, reference_sparsity):
+    """Translate reference sparsity into a guaranteed number of key blocks."""
+    if reference_sparsity is None or block_count <= 0:
+        return 0
+    sparsity = max(0.0, min(0.99, float(reference_sparsity)))
+    return max(1, min(block_count, math.ceil((1.0 - sparsity) * block_count)))
+
+
 def get_block_map(q, k, topk_ratio, BLKQ=128, BLKK=128, protect_upto=0,
-                  prev_lut=None, return_history=False):
+                  prev_lut=None, protect_ranges=None, return_history=False,
+                  stabilize_query_from=0, reference_ranges=None,
+                  reference_sparsity=None):
     """Return ``(lut, topk)``: the key blocks each query block should attend to.
 
     ``q``/``k`` are ``(B, L, H, D)`` contiguous. ``lut`` comes back as
@@ -112,6 +189,17 @@ def get_block_map(q, k, topk_ratio, BLKQ=128, BLKK=128, protect_upto=0,
     are added on top of the top-k budget rather than displacing video, so video
     coverage is unchanged and the extra cost is the prefix itself (~7%).
 
+    ``protect_ranges`` provides the same guarantee for specific half-open token
+    spans. H3 uses it for language and audio while excluding large visual-
+    reference spans. It is merged with ``protect_upto`` when both are supplied.
+
+    ``reference_ranges`` plus a non-None ``reference_sparsity`` adds a second,
+    segment-local selection tier for visual conditioning. For example, 0.80
+    guarantees the best-scoring 20% of each reference block range per query,
+    while 0.0 guarantees all of it. ``None`` disables the quota. This is
+    intentionally additive so reference safety never evicts video blocks that
+    the unmodified sparse route would have selected.
+
     ``prev_lut``, when given the previous call's ``lut`` for this same layer,
     nudges those blocks' scores up before top-k -- pure per-step top-k has no
     memory, so on a near-tie between two similarly-scored blocks the winner
@@ -120,7 +208,8 @@ def get_block_map(q, k, topk_ratio, BLKQ=128, BLKK=128, protect_upto=0,
     pick. The nudge only breaks a close call; a block that's actually a
     better fit this step still wins. Silently ignored if its shape doesn't
     match this call's (e.g. right after a dense step, or the first sparse
-    call of a run).
+    call of a run). ``stabilize_query_from`` is a token offset; query blocks
+    before the target-video region are neither retained nor biased.
     """
     pooled_q = mean_pool(q, BLKQ)
     # Smooth-k (SageAttention's trick), folded in rather than materialised.
@@ -135,27 +224,55 @@ def get_block_map(q, k, topk_ratio, BLKQ=128, BLKK=128, protect_upto=0,
 
     pooled_score = pooled_q @ pooled_k.transpose(-1, -2)      # (B, H, NQ, NK)
 
+    NQ = pooled_score.shape[-2]
+    sticky_q_start = min(
+        NQ,
+        (max(0, int(stabilize_query_from)) + BLKQ - 1) // BLKQ,
+    )
+    sticky_score = pooled_score[..., sticky_q_start:, :]
     if (
         prev_lut is not None
-        and prev_lut.shape[:3] == pooled_score.shape[:3]
+        and prev_lut.shape[:3] == sticky_score.shape[:3]
         and prev_lut.shape[-1] <= pooled_score.shape[-1]
     ):
-        row_scale = pooled_score.detach().abs().amax(dim=-1, keepdim=True).clamp(min=1e-6)
+        row_scale = sticky_score.detach().abs().amax(dim=-1, keepdim=True).clamp(min=1e-6)
         bonus = (row_scale * _STICKY_BONUS_FRAC).expand(*prev_lut.shape)
-        pooled_score.scatter_add_(-1, prev_lut.long(), bonus)
+        sticky_score.scatter_add_(-1, prev_lut.long(), bonus)
 
     NK = pooled_score.shape[-1]
     # FIX vs upstream: keep at least one key block.
     topk = max(1, min(NK, int(topk_ratio * NK)))
 
-    n_pinned = 0
-    if protect_upto > 0:
-        n_pinned = min((int(protect_upto) + BLKK - 1) // BLKK, NK)
-        # Ranking them above everything else is what pins them; widening topk by
-        # the same amount is what stops them evicting the blocks top-k chose.
-        if n_pinned > 0:
-            pooled_score[..., :n_pinned] = float("inf")
-            topk = min(NK, topk + n_pinned)
+    protected_blocks = get_protected_block_ranges(
+        protect_upto, protect_ranges, BLKK, NK
+    )
+    n_pinned = sum(last - first for first, last in protected_blocks)
+    n_reference_quota = 0
+    if reference_sparsity is not None:
+        reference_sparsity = float(reference_sparsity)
+        reference_blocks = get_reference_quota_block_ranges(
+            reference_ranges, protect_upto, protect_ranges, BLKK, NK
+        )
+        for first, last in reference_blocks:
+            block_count = last - first
+            keep = get_reference_quota_keep_count(
+                block_count, reference_sparsity
+            )
+            if keep <= 0:
+                continue
+            selected_reference = torch.topk(
+                pooled_score[..., first:last], keep, dim=-1, sorted=False
+            ).indices + first
+            pooled_score.scatter_(-1, selected_reference, float("inf"))
+            n_reference_quota += keep
+
+    # Ranking protected blocks above everything else is what pins them;
+    # widening topk by the same amount stops them evicting the blocks that the
+    # ordinary top-k selection would otherwise keep.
+    for first, last in protected_blocks:
+        pooled_score[..., first:last] = float("inf")
+    if n_pinned > 0 or n_reference_quota > 0:
+        topk = min(NK, topk + n_pinned + n_reference_quota)
 
     selected = torch.topk(pooled_score, topk, dim=-1, sorted=False)
     lut = selected.indices
@@ -168,13 +285,15 @@ def get_block_map(q, k, topk_ratio, BLKQ=128, BLKK=128, protect_upto=0,
     # entries nearest the cutoff -- the only ones that can plausibly flip.
     # Strong selections do not need a sticky bonus, so dropping them from
     # the retained history costs nothing but the VRAM they were sitting on.
+    history_indices = lut[..., sticky_q_start:, :]
+    history_values = selected.values[..., sticky_q_start:, :]
     history_width = min(_STICKY_HISTORY_WIDTH, topk)
     if history_width == topk:
-        history = lut
+        history = history_indices
     else:
         boundary_pos = torch.topk(
-            selected.values, history_width, dim=-1, largest=False, sorted=False
+            history_values, history_width, dim=-1, largest=False, sorted=False
         ).indices
-        history = torch.gather(lut, -1, boundary_pos)
+        history = torch.gather(history_indices, -1, boundary_pos)
 
     return lut_i32, topk, history.to(torch.int32).contiguous()
