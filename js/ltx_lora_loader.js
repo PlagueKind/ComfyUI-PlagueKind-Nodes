@@ -582,9 +582,9 @@ app.registerExtension({
             node.addDOMWidget("lora_ui", "HTML", container);
             initialData.forEach(d => addSlot(d));
             requestAnimationFrame(syncSize);
-            const origConfigure = node.configure?.bind(node);
+            const _origConfigure = node.configure;
             node.configure = function (data) {
-                origConfigure?.(data);
+                if (_origConfigure) _origConfigure.call(node, data);
                 slots.forEach(s => s.remove());
                 slots = [];
                 try {
