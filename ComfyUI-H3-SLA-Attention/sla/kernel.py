@@ -117,6 +117,16 @@ _LADDER = {
     (128, 128): ((8, 2), (4, 2), (8, 1), (4, 1)),
     (64, 128): ((4, 2), (8, 2), (4, 1)),
     (64, 64): ((4, 1), (4, 3), (8, 3), (8, 1)),
+    # UNBENCHMARKED on this kernel/hardware -- no measured (num_warps,
+    # num_stages) exists for 32x32 here. (4, 2) is first based on external
+    # evidence, not a local measurement: published Triton flash-attention
+    # autotune sweeps that include a 32x32 tile consistently pair it with
+    # num_warps=4, num_stages=2 rather than lower warp counts (e.g.
+    # triton-lang/triton discussion #8261's BLOCK_BR=32,BLOCK_BC=32 config).
+    # A local benchmark run measured 32x32 at the same speed as 64x64 with
+    # the earlier (2, 1)-first ordering, so this reordering has not been
+    # re-verified to actually help -- treat as still unproven, not a fix.
+    (32, 32): ((4, 2), (2, 1), (4, 1), (2, 2)),
 }
 _CHOSEN: dict = {}
 
@@ -129,7 +139,7 @@ def block_sparse_attention(q, k, v, lut, topk, BLOCK_M, BLOCK_N, qk_scale=None):
     """
     assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
     assert lut.is_contiguous()
-    assert BLOCK_M in (64, 128) and BLOCK_N in (64, 128)
+    assert BLOCK_M in (32, 64, 128) and BLOCK_N in (32, 64, 128)
 
     B, LQ, H, D = q.shape
     LK = k.shape[1]
