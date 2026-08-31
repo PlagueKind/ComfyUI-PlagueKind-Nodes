@@ -13,7 +13,11 @@ current_dir = os.path.dirname(__file__)
 # imports, so they're loaded as real packages and merged into this pack's
 # V1-style mappings below, instead of being flattened by the generic
 # per-file walker (which has no concept of packages or comfy_entrypoint).
-EXTENSION_PACKAGES = ["ComfyUI-H3-AdaLN-LoRA-Fix", "ComfyUI-H3-SLA-Attention"]
+EXTENSION_PACKAGES = [
+    "ComfyUI-H3-AdaLN-LoRA-Fix",
+    "ComfyUI-H3-SLA-Attention",
+    "ComfyUI-H3-UltimateUpscale-LD",
+]
 
 
 def _run_async(coro):
