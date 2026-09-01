@@ -72,6 +72,15 @@ class ExtendContextTrimTests(unittest.TestCase):
                 "audio_latent": torch.zeros(1, 32, 2, 0),
             }, 0, 85)
 
+        for invalid in (3.7, "3", True):
+            with self.subTest(num_frames=invalid):
+                with self.assertRaisesRegex(ValueError, "num_frames' must be an integer"):
+                    module.trim_keyframe({
+                        "kind": "context",
+                        "num_frames": invalid,
+                        "latent": torch.zeros(1, 16, 3, 2, 2),
+                    }, 0, 85)
+
     def test_regular_absolute_keyframe_behavior_is_unchanged(self):
         latent = torch.randn(1, 16, 1, 4, 4)
         keyframe = {"resolved_frame_index": 0, "latent": latent}

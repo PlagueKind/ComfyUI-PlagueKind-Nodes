@@ -467,6 +467,11 @@ def trim_keyframe(kf, f0, f1):
                 f"MiniMax H3 {kind} keyframe requires both '{latent_key}' "
                 "and 'num_frames'."
             )
+        if not isinstance(num_frames, int) or isinstance(num_frames, bool):
+            raise ValueError(
+                f"MiniMax H3 {kind} keyframe 'num_frames' must be an integer; "
+                f"got {type(num_frames).__name__}."
+            )
         expected_ndim = 5 if kind == "context" else 4
         if getattr(latent, "ndim", None) != expected_ndim:
             raise ValueError(
@@ -476,7 +481,7 @@ def trim_keyframe(kf, f0, f1):
         actual_frames = int(latent.shape[time_axis])
         if actual_frames <= 0:
             raise ValueError(f"MiniMax H3 {kind} keyframe contains no temporal frames.")
-        if int(num_frames) != actual_frames:
+        if num_frames != actual_frames:
             raise ValueError(
                 f"MiniMax H3 {kind} keyframe declares num_frames={num_frames}, "
                 f"but its {latent_key} contains {actual_frames} temporal frames."
