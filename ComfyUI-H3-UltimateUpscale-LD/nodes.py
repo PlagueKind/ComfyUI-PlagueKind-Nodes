@@ -450,7 +450,7 @@ def crop_keyframes_to_tile(cond, src_h, src_w, r0, c0, tr, tc):
 
 
 def trim_keyframe(kf, f0, f1):
-    """Copy a keyframe cut to the portion fully inside pixel frames [f0, f1)."""
+    """Copy/rebase one keyframe for target pixel frames ``[f0, f1)``."""
     kind = kf.get("kind")
     if kind in ("context", "context_audio"):
         # Extend conditioning places these rows immediately BEFORE the target's
@@ -458,6 +458,21 @@ def trim_keyframe(kf, f0, f1):
         # them for the first temporal chunk only. Later chunks are anchored to
         # the preceding re-sampled result by anchor_conditioning(), and keeping
         # the original context there would incorrectly replay it at every seam.
+        latent_key = "latent" if kind == "context" else "audio_latent"
+        time_axis = 2 if kind == "context" else -1
+        latent = kf.get(latent_key)
+        num_frames = kf.get("num_frames")
+        if latent is None or num_frames is None:
+            raise ValueError(
+                f"MiniMax H3 {kind} keyframe requires both '{latent_key}' "
+                "and 'num_frames'."
+            )
+        actual_frames = int(latent.shape[time_axis])
+        if int(num_frames) != actual_frames:
+            raise ValueError(
+                f"MiniMax H3 {kind} keyframe declares num_frames={num_frames}, "
+                f"but its {latent_key} contains {actual_frames} temporal frames."
+            )
         return dict(kf) if f0 == 0 else None
 
     if "resolved_frame_index" not in kf:
