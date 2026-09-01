@@ -451,6 +451,22 @@ def crop_keyframes_to_tile(cond, src_h, src_w, r0, c0, tr, tc):
 
 def trim_keyframe(kf, f0, f1):
     """Copy a keyframe cut to the portion fully inside pixel frames [f0, f1)."""
+    kind = kf.get("kind")
+    if kind in ("context", "context_audio"):
+        # Extend conditioning places these rows immediately BEFORE the target's
+        # frame 0, so they intentionally have no resolved_frame_index. Preserve
+        # them for the first temporal chunk only. Later chunks are anchored to
+        # the preceding re-sampled result by anchor_conditioning(), and keeping
+        # the original context there would incorrectly replay it at every seam.
+        return dict(kf) if f0 == 0 else None
+
+    if "resolved_frame_index" not in kf:
+        raise ValueError(
+            "MiniMax H3 keyframe is missing 'resolved_frame_index' "
+            f"(kind={kind!r}); only extend context/context_audio keyframes may "
+            "omit an absolute target-frame position."
+        )
+
     idx = kf["resolved_frame_index"]
     latent = kf.get("latent")
     audio_latent = kf.get("audio_latent")
@@ -500,6 +516,12 @@ def reanchor_conditioning(cond, f0, f1, spatial=None):
         nd = dict(d)
         kfs = nd.get("minimax_keyframes")
         if kfs:
+            # Keyframe indices below are rebased from the full target onto this
+            # chunk. PackedLayout validates a local last-frame anchor against
+            # frame_count - 1, so the count must be rebased at the same time.
+            # Keep it even when no original keyframe survives: a later
+            # anchor_conditioning() call may insert a local frame-0 anchor.
+            nd["minimax_frame_count"] = f1 - f0
             trimmed = [trim_keyframe(kf, f0, f1) for kf in kfs]
             trimmed = [kf for kf in trimmed if kf is not None]
             if trimmed:
@@ -509,8 +531,8 @@ def reanchor_conditioning(cond, f0, f1, spatial=None):
                         if lt is not None and (lt.shape[3] != spatial[0] or lt.shape[4] != spatial[1]):
                             B, C, T, H, W = lt.shape
                             kf["latent"] = F.interpolate(
-                                lt.view(B * T, C, H, W), size=spatial, mode="bilinear", align_corners=False
-                            ).view(B, C, T, spatial[0], spatial[1])
+                                lt.reshape(B * T, C, H, W), size=spatial, mode="bilinear", align_corners=False
+                            ).reshape(B, C, T, spatial[0], spatial[1])
                 nd["minimax_keyframes"] = trimmed
             else:
                 nd.pop("minimax_keyframes", None)
