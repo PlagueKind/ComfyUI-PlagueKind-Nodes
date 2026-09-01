@@ -467,7 +467,15 @@ def trim_keyframe(kf, f0, f1):
                 f"MiniMax H3 {kind} keyframe requires both '{latent_key}' "
                 "and 'num_frames'."
             )
+        expected_ndim = 5 if kind == "context" else 4
+        if getattr(latent, "ndim", None) != expected_ndim:
+            raise ValueError(
+                f"MiniMax H3 {kind} keyframe '{latent_key}' must be a "
+                f"{expected_ndim}D tensor; got {getattr(latent, 'ndim', None)!r}D."
+            )
         actual_frames = int(latent.shape[time_axis])
+        if actual_frames <= 0:
+            raise ValueError(f"MiniMax H3 {kind} keyframe contains no temporal frames.")
         if int(num_frames) != actual_frames:
             raise ValueError(
                 f"MiniMax H3 {kind} keyframe declares num_frames={num_frames}, "

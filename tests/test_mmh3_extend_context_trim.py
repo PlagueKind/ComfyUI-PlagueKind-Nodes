@@ -58,6 +58,20 @@ class ExtendContextTrimTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "contains 20 temporal frames"):
             module.trim_keyframe(mismatched, 0, 85)
 
+        with self.assertRaisesRegex(ValueError, "must be a 5D tensor"):
+            module.trim_keyframe({
+                "kind": "context",
+                "num_frames": 2,
+                "latent": torch.zeros(2, 2),
+            }, 0, 85)
+
+        with self.assertRaisesRegex(ValueError, "contains no temporal frames"):
+            module.trim_keyframe({
+                "kind": "context_audio",
+                "num_frames": 0,
+                "audio_latent": torch.zeros(1, 32, 2, 0),
+            }, 0, 85)
+
     def test_regular_absolute_keyframe_behavior_is_unchanged(self):
         latent = torch.randn(1, 16, 1, 4, 4)
         keyframe = {"resolved_frame_index": 0, "latent": latent}
