@@ -15,7 +15,7 @@ from comfy_api.latest import io
 log = logging.getLogger("H3Utils")
 
 BLOCK_SIZES = ("32", "64", "128")
-REFERENCE_PROTECTION_MODES = ("True", "Light", "Off")
+REFERENCE_PROTECTION_MODES = ("Heavy Enforcement", "Light", "Off")
 # Mirrors an existing, widely-used sage-attention kernel dropdown's mode
 # list exactly (see sla/patch.py for the per-mode kernel + pv_accum_dtype
 # each one calls),
@@ -189,17 +189,22 @@ class H3SLAAttention(io.ComfyNode):
                         "query rows are stabilized; text and audio choices "
                         "remain step-local. It is a fix for that one specific "
                         "symptom, not a general quality dial. - Uses more Vram ")),
-                io.Boolean.Input("reference_protection",
+                io.Combo.Input("reference_protection",
                     display_name="Protect Vid/Ref",
-                    default=False, label_on="Light", label_off="Off",
+                    options=list(REFERENCE_PROTECTION_MODES), default="Off",
                     optional=True,
                     tooltip=(
-                        "Protect Image/Video Reference. ON (Light) uses fixed "
-                        "0.85 reference sparsity and guarantees the "
-                        "best-scoring 15% of each visual-reference range. OFF "
+                        "Protect Image/Video Reference. Heavy Enforcement "
+                        "guarantees every Qwen vision-token, "
+                        "conditioning/image-reference, and video-reference "
+                        "block, matching the broad legacy prefix protection -- "
+                        "this is a reinforcement of those blocks, not a "
+                        "protection tuned for reference quality, and is most "
+                        "likely unusable with max ref size mode. Light uses "
+                        "fixed 0.85 reference sparsity and guarantees the "
+                        "best-scoring 15% of each visual-reference range. Off "
                         "adds no special quota; references still participate "
-                        "in ordinary top-k."
-                        "Default Off preserves the precise "
+                        "in ordinary top-k. Default Off preserves the precise "
                         "audio patch's fastest behaviour.")),
             ],
             outputs=[io.Model.Output()],
@@ -210,7 +215,7 @@ class H3SLAAttention(io.ComfyNode):
                 min_seq_len=8192, dense_last_steps=1, protect_audio=True,
                 enabled=True, dense_steps="0", dense_backend="comfy_kitchen",
                 disable_fp16_accum=True, stabilize_motion=False,
-                reference_protection=False) -> io.NodeOutput:
+                reference_protection="Off") -> io.NodeOutput:
         if not enabled:
             log.info("[H3Utils] SLA disabled; model passed through unchanged.")
             return io.NodeOutput(model)
@@ -228,7 +233,7 @@ class H3SLAAttention(io.ComfyNode):
                 disable_fp16_accum=disable_fp16_accum,
                 protect_audio=protect_audio,
                 stabilize_motion=stabilize_motion,
-                reference_protection=("Light" if reference_protection else "Off"),
+                reference_protection=reference_protection,
             )
         except Exception:                                # noqa: BLE001
             # Triton missing, an incompatible GPU, a ComfyUI API change -- none

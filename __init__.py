@@ -15,6 +15,7 @@ current_dir = os.path.dirname(__file__)
 # per-file walker (which has no concept of packages or comfy_entrypoint).
 EXTENSION_PACKAGES = [
     "ComfyUI-H3-AdaLN-LoRA-Fix",
+    "ComfyUI-H3-MiniMax-Cache",
     "ComfyUI-H3-SLA-Attention",
     "ComfyUI-H3-UltimateUpscale-LD",
 ]

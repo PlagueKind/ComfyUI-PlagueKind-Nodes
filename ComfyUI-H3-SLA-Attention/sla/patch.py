@@ -484,15 +484,15 @@ REFERENCE_LIGHT_SPARSITY = 0.85
 
 
 def _resolve_reference_sparsity(reference_protection):
-    """Resolve True/Light/Off; old Manual workflows migrate to fixed Light."""
+    """Resolve Heavy Enforcement/Light/Off; old True/Manual values migrate for compatibility."""
     if reference_protection is True:
         mode = "true"
     elif reference_protection is False or reference_protection is None:
         mode = "off"
     else:
         mode = str(reference_protection).strip().lower()
-    if mode == "true":
-        return mode, 0.0
+    if mode in ("heavy enforcement", "true"):
+        return "true", 0.0
     if mode in ("light", "manual"):
         return "light", REFERENCE_LIGHT_SPARSITY
     return "off", None
@@ -780,8 +780,10 @@ def patch_h3_sla(model, sparsity_ratio=0.90, block_size=64, min_seq_len=8192,
     reference-audio, and target-audio ranges.
 
     ``reference_protection`` controls a separate visual-reference quota:
-    ``Off`` leaves references to global top-k, ``True`` guarantees all of them,
-    and ``Light`` guarantees the best 15% of every reference range without
+    ``Off`` leaves references to global top-k, ``Heavy Enforcement``
+    guarantees all of them (a reinforcement of those blocks, not a quality
+    tuned protection, and most likely unusable with max ref size mode), and
+    ``Light`` guarantees the best 15% of every reference range without
     displacing ordinary video choices.
     """
     blkq = int(block_size)
