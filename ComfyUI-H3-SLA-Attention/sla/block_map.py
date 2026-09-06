@@ -83,6 +83,14 @@ def mean_pool(x, BLK):
     return x_mean
 
 
+# log2(e). Every score that reaches the kernel's online-softmax merge is in
+# base-2 units (qk * qk_scale * LOG2E, so tl.math.exp2 does what exp() would).
+# The tail term is computed here in Python and merged into that same running
+# accumulator inside the kernel, so it has to land in the same units or the
+# merge is comparing two different scales.
+_LOG2E = 1.4426950408889634
+
+
 # How large a nudge a previously-selected block gets, as a fraction of that
 # query row's own max score -- relative, not absolute, since raw dot-product
 # magnitude varies by layer and by how far into denoising a step is. Not
@@ -175,7 +183,8 @@ def get_reference_quota_keep_count(block_count, reference_sparsity):
 def get_block_map(q, k, topk_ratio, BLKQ=128, BLKK=128, protect_upto=0,
                   prev_lut=None, protect_ranges=None, return_history=False,
                   stabilize_query_from=0, reference_ranges=None,
-                  reference_sparsity=None):
+                  reference_sparsity=None, v=None, qk_scale=None,
+                  tail_correction=False):
     """Return ``(lut, topk)``: the key blocks each query block should attend to.
 
     ``q``/``k`` are ``(B, L, H, D)`` contiguous. ``lut`` comes back as
@@ -210,6 +219,16 @@ def get_block_map(q, k, topk_ratio, BLKQ=128, BLKK=128, protect_upto=0,
     match this call's (e.g. right after a dense step, or the first sparse
     call of a run). ``stabilize_query_from`` is a token offset; query blocks
     before the target-video region are neither retained nor biased.
+
+    ``tail_correction``, together with ``v``, adds one pooled term per query
+    block summarising every key block that did NOT make top-k -- unlike plain
+    top-k, which discards them outright, so nothing leaves the softmax. It is
+    scored from the same pooled centroids already computed for selection (no
+    extra qk pass), so the added cost is one more mean-pool of V plus a
+    softmax-shaped reduction over the unselected columns -- cheap relative to
+    the attention kernel itself. Returns ``None`` in place of the tail tensors
+    when there is nothing left over to pool (``topk`` already covers every key
+    block), which happens at low sparsity or very short sequences.
     """
     pooled_q = mean_pool(q, BLKQ)
     # Smooth-k (SageAttention's trick), folded in rather than materialised.
@@ -278,8 +297,34 @@ def get_block_map(q, k, topk_ratio, BLKQ=128, BLKK=128, protect_upto=0,
     lut = selected.indices
     lut_i32 = lut.to(torch.int32).contiguous()
 
+    tail = None
+    if tail_correction and v is not None and topk < NK:
+        # Every position NOT in lut, scored the same way lut's own ranking
+        # was: pooled_score has pinned/reference-quota entries already set to
+        # +inf above, but those are always inside lut (they rank first), so
+        # they're never read here -- only genuinely unselected columns are.
+        if qk_scale is None:
+            qk_scale = q.shape[-1] ** -0.5
+        pooled_v = mean_pool(v, BLKK)
+        selected_mask = torch.zeros_like(pooled_score, dtype=torch.bool)
+        selected_mask.scatter_(-1, lut, True)
+        # Same base-2 convention as the kernel's own qk (see _LOG2E above),
+        # so the merge downstream is combining like units, not natural-log
+        # scores against base-2 ones.
+        tail_score = pooled_score.masked_fill(selected_mask, float("-inf"))
+        tail_score = tail_score * (qk_scale * _LOG2E)
+        tail_max = tail_score.amax(dim=-1, keepdim=True)          # (B,H,NQ,1)
+        tail_p = torch.exp2(tail_score - tail_max)
+        tail_num = tail_p @ pooled_v                              # (B,H,NQ,D)
+        tail_den = tail_p.sum(dim=-1, keepdim=True)                # (B,H,NQ,1)
+        tail = (
+            tail_max.squeeze(-1).contiguous(),
+            tail_num.contiguous(),
+            tail_den.squeeze(-1).contiguous(),
+        )
+
     if not return_history:
-        return lut_i32, topk
+        return (lut_i32, topk, tail) if tail_correction else (lut_i32, topk)
 
     # Bound what stabilize_motion carries into the next step to the
     # entries nearest the cutoff -- the only ones that can plausibly flip.
@@ -296,4 +341,7 @@ def get_block_map(q, k, topk_ratio, BLKQ=128, BLKK=128, protect_upto=0,
         ).indices
         history = torch.gather(history_indices, -1, boundary_pos)
 
-    return lut_i32, topk, history.to(torch.int32).contiguous()
+    history = history.to(torch.int32).contiguous()
+    if tail_correction:
+        return lut_i32, topk, history, tail
+    return lut_i32, topk, history

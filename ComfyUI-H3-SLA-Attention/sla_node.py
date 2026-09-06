@@ -206,6 +206,90 @@ class H3SLAAttention(io.ComfyNode):
                         "adds no special quota; references still participate "
                         "in ordinary top-k. Default Off preserves the precise "
                         "audio patch's fastest behaviour.")),
+                io.Boolean.Input("tail_correction", default=False,
+                    label_on="on (experimental)", label_off="off",
+                    optional=True,
+                    tooltip=(
+                        "Instead of a hard zero for every key block topk left "
+                        "out, fold in one pooled term standing in for all of "
+                        "them, so nothing leaves the softmax -- same idea as "
+                        "a widely-used block-sparse kernel's tail handling. Scored from "
+                        "the same pooled centroids selection already computes, "
+                        "so the only added cost is one more mean-pool of V "
+                        "plus a small reduction per call, not a second "
+                        "attention pass. Should help most at high sparsity, "
+                        "where the discarded tail is largest. Off by default: "
+                        "new, and its effect on H3 output quality specifically "
+                        "hasn't been validated the way sparsity_ratio's "
+                        "defaults have -- test before trusting it in a real "
+                        "render.")),
+                io.Boolean.Input("use_int8_qk", default=False,
+                    label_on="on (experimental, untested)", label_off="off",
+                    optional=True,
+                    tooltip=(
+                        "Quantize Q and K to int8 (per-token, dynamic scale) "
+                        "before the QK dot product on the selected topk "
+                        "blocks -- PV stays full precision. This is "
+                        "SageAttention's qk_int8_pv_fp16 split, not full int8 "
+                        "attention, and it's a different lever from "
+                        "dense_backend above: that setting only affects dense "
+                        "fall-through steps, this affects the sparse compute "
+                        "itself, on every sparse step. Ignored entirely when "
+                        "engine is comfy_kitchen, which quantizes internally "
+                        "regardless. UNTESTED ON HARDWARE: the "
+                        "quantize/dequantize math checks out against exact "
+                        "fp32 scores in isolation, but real speed, launch "
+                        "stability, and output quality on H3 have not been "
+                        "measured on a GPU. Try it against a known-good render "
+                        "before trusting it, and expect to possibly hit a "
+                        "launch failure on some GPU/Triton combinations before "
+                        "it's been shaken out.")),
+                io.Boolean.Input("use_int8_pv", default=False,
+                    label_on="on (experimental, untested)", label_off="off",
+                    optional=True,
+                    tooltip=(
+                        "Quantize P (post-softmax weights) and V to int8 for "
+                        "the second matmul -- independent of use_int8_qk "
+                        "above, since P's value doesn't depend on how QK was "
+                        "computed. V uses per-channel scaling, not per-token "
+                        "like Q/K: per-token would put the scale inside the "
+                        "dimension this matmul contracts over and it couldn't "
+                        "be factored back out afterward. Combined with "
+                        "use_int8_qk this is full int8 attention on the "
+                        "sparse path; used alone it's int8 PV with QK still "
+                        "at native precision. Also ignored under "
+                        "engine=comfy_kitchen. UNTESTED ON HARDWARE, same "
+                        "caveat as use_int8_qk: the quantize math (including "
+                        "the two combined) checks out in a standalone numpy "
+                        "harness against dense ground truth, but the real "
+                        "Triton kernel path has not run on a GPU.")),
+                io.Combo.Input("engine", options=["triton", "comfy_kitchen"],
+                    default="triton", optional=True,
+                    tooltip=(
+                        "Which attention implementation runs the sparse path. "
+                        "triton (default) is this node pack's own kernel -- "
+                        "every other widget above applies to it fully. "
+                        "comfy_kitchen instead calls comfy_kitchen's real "
+                        "compiled sol_attn kernel (Comfy-Org/ComfyUI PR "
+                        "#16072, needs comfy-kitchen>=0.2.32 installed): "
+                        "genuine CUDA int8 compute and a pooled tail term "
+                        "gated by tail_correction, same as triton. "
+                        "protect_audio, protect_ranges, and "
+                        "reference_protection all work here too -- K/V get "
+                        "reordered so the whole protected set is contiguous "
+                        "at the front, then sol_attn's single sink range "
+                        "covers it, which is exact for everything except "
+                        "reference_protection's Light tier specifically "
+                        "(approximated with a query-averaged ranking instead "
+                        "of true per-query selection -- Heavy Enforcement has "
+                        "no such gap). stabilize_motion has no equivalent "
+                        "regardless (sol_attn's routing is stateless per "
+                        "call) and is silently ignored with a one-time log "
+                        "warning. use_int8_qk/use_int8_pv above are ignored "
+                        "since the real kernel already quantizes "
+                        "unconditionally. Falls back to dense the same as "
+                        "any other kernel failure if comfy_kitchen is "
+                        "unavailable or throws.")),
             ],
             outputs=[io.Model.Output()],
         )
@@ -215,7 +299,8 @@ class H3SLAAttention(io.ComfyNode):
                 min_seq_len=8192, dense_last_steps=1, protect_audio=True,
                 enabled=True, dense_steps="0", dense_backend="comfy_kitchen",
                 disable_fp16_accum=True, stabilize_motion=False,
-                reference_protection="Off") -> io.NodeOutput:
+                reference_protection="Off", tail_correction=False,
+                use_int8_qk=False, use_int8_pv=False, engine="triton") -> io.NodeOutput:
         if not enabled:
             log.info("[H3Utils] SLA disabled; model passed through unchanged.")
             return io.NodeOutput(model)
@@ -234,6 +319,10 @@ class H3SLAAttention(io.ComfyNode):
                 protect_audio=protect_audio,
                 stabilize_motion=stabilize_motion,
                 reference_protection=reference_protection,
+                tail_correction=tail_correction,
+                use_int8_qk=use_int8_qk,
+                use_int8_pv=use_int8_pv,
+                engine=engine,
             )
         except Exception:                                # noqa: BLE001
             # Triton missing, an incompatible GPU, a ComfyUI API change -- none
