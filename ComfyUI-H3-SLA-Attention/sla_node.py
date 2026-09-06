@@ -229,7 +229,11 @@ class H3SLAAttention(io.ComfyNode):
                     tooltip=(
                         "Quantize Q and K to int8 (per-token, dynamic scale) "
                         "before the QK dot product on the selected topk "
-                        "blocks -- PV stays full precision. This is "
+                        "blocks -- PV stays full precision (the mirror "
+                        "use_int8_pv toggle was removed from this node: its "
+                        "hidden widget could still be converted to an input "
+                        "socket and connected, which broke the node -- PV "
+                        "quantization is no longer exposed here). This is "
                         "SageAttention's qk_int8_pv_fp16 split, not full int8 "
                         "attention, and it's a different lever from "
                         "dense_backend above: that setting only affects dense "
@@ -244,25 +248,6 @@ class H3SLAAttention(io.ComfyNode):
                         "before trusting it, and expect to possibly hit a "
                         "launch failure on some GPU/Triton combinations before "
                         "it's been shaken out.")),
-                io.Boolean.Input("use_int8_pv", default=False,
-                    label_on="on (experimental, untested)", label_off="off",
-                    optional=True,
-                    tooltip=(
-                        "Quantize P (post-softmax weights) and V to int8 for "
-                        "the second matmul -- independent of use_int8_qk "
-                        "above, since P's value doesn't depend on how QK was "
-                        "computed. V uses per-channel scaling, not per-token "
-                        "like Q/K: per-token would put the scale inside the "
-                        "dimension this matmul contracts over and it couldn't "
-                        "be factored back out afterward. Combined with "
-                        "use_int8_qk this is full int8 attention on the "
-                        "sparse path; used alone it's int8 PV with QK still "
-                        "at native precision. Also ignored under "
-                        "engine=comfy_kitchen. UNTESTED ON HARDWARE, same "
-                        "caveat as use_int8_qk: the quantize math (including "
-                        "the two combined) checks out in a standalone numpy "
-                        "harness against dense ground truth, but the real "
-                        "Triton kernel path has not run on a GPU.")),
                 io.Combo.Input("engine", options=["triton", "comfy_kitchen"],
                     default="triton", optional=True,
                     tooltip=(
@@ -272,24 +257,19 @@ class H3SLAAttention(io.ComfyNode):
                         "comfy_kitchen instead calls comfy_kitchen's real "
                         "compiled sol_attn kernel (Comfy-Org/ComfyUI PR "
                         "#16072, needs comfy-kitchen>=0.2.32 installed): "
-                        "genuine CUDA int8 compute and a pooled tail term "
-                        "gated by tail_correction, same as triton. "
-                        "protect_audio, protect_ranges, and "
-                        "reference_protection all work here too -- K/V get "
-                        "reordered so the whole protected set is contiguous "
-                        "at the front, then sol_attn's single sink range "
-                        "covers it, which is exact for everything except "
-                        "reference_protection's Light tier specifically "
-                        "(approximated with a query-averaged ranking instead "
-                        "of true per-query selection -- Heavy Enforcement has "
-                        "no such gap). stabilize_motion has no equivalent "
-                        "regardless (sol_attn's routing is stateless per "
-                        "call) and is silently ignored with a one-time log "
-                        "warning. use_int8_qk/use_int8_pv above are ignored "
-                        "since the real kernel already quantizes "
-                        "unconditionally. Falls back to dense the same as "
-                        "any other kernel failure if comfy_kitchen is "
-                        "unavailable or throws.")),
+                        "genuine CUDA int8 compute and a built-in pooled tail "
+                        "term, but it can only express ONE contiguous "
+                        "protected range, has no reference-quota tier, and "
+                        "has no cross-step stabilize_motion -- reference_"
+                        "protection, multi-span protect_ranges, and "
+                        "stabilize_motion are silently disabled (one-time log "
+                        "warning each) rather than approximated, and "
+                        "tail_correction/use_int8_qk above are ignored "
+                        "since the real kernel quantizes internally "
+                        "regardless, but now honours tail_correction's "
+                        "on/off setting rather than always applying it. Both "
+                        "fall back to dense the same as any other kernel "
+                        "failure if their kernel is unavailable or throws.")),
             ],
             outputs=[io.Model.Output()],
         )
@@ -300,7 +280,7 @@ class H3SLAAttention(io.ComfyNode):
                 enabled=True, dense_steps="0", dense_backend="comfy_kitchen",
                 disable_fp16_accum=True, stabilize_motion=False,
                 reference_protection="Off", tail_correction=False,
-                use_int8_qk=False, use_int8_pv=False, engine="triton") -> io.NodeOutput:
+                use_int8_qk=False, engine="triton") -> io.NodeOutput:
         if not enabled:
             log.info("[H3Utils] SLA disabled; model passed through unchanged.")
             return io.NodeOutput(model)
@@ -321,7 +301,6 @@ class H3SLAAttention(io.ComfyNode):
                 reference_protection=reference_protection,
                 tail_correction=tail_correction,
                 use_int8_qk=use_int8_qk,
-                use_int8_pv=use_int8_pv,
                 engine=engine,
             )
         except Exception:                                # noqa: BLE001
