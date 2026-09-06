@@ -21,7 +21,26 @@ import logging
 
 import torch
 
-from .block_map import get_block_map, get_protected_block_ranges
+try:
+    # Only present on ComfyUI builds with Comfy-Org/ComfyUI#16148 merged.
+    # Its absence means the graph-break/VRAM-leak bug that fix addresses may
+    # simply not exist yet on this install either -- the no-op fallback
+    # below reproduces the pre-fix behaviour exactly, not a degraded one.
+    from comfy.model_prefetch import pause_malloc_graph
+except ImportError:
+    import contextlib
+
+    @contextlib.contextmanager
+    def pause_malloc_graph(sync=False):
+        yield
+
+from .block_map import (
+    get_block_map,
+    get_protected_block_ranges,
+    get_reference_quota_block_ranges,
+    get_reference_quota_keep_count,
+    mean_pool,
+)
 from .kernel import block_sparse_attention, warm_launch_config
 
 log = logging.getLogger("H3Utils")
@@ -281,6 +300,7 @@ def _summarise(state, sparsity, blkq, blkk):
 
 
 _CK_WARNED: set = set()
+_CK_BLOCK = 64   # comfy_kitchen's sol_attn hardcodes this key-block size
 
 
 def _ck_warn_once(key, message):
@@ -289,55 +309,135 @@ def _ck_warn_once(key, message):
         log.warning("[H3Utils] comfy_kitchen engine: %s", message)
 
 
+def _ck_rank_blocks_globally(qb, kb, first, last, qk_scale):
+    """Rank key blocks [first, last) by a query-AVERAGED pooled score.
+
+    This is the same smoothed-mean-pool-then-dot scoring block_map.py's own
+    get_block_map uses for routing, except averaged over every query block
+    into one representative query vector first. That averaging is the whole
+    point: comfy_kitchen's ``sink_blocks`` is one set for the entire call,
+    not per query block, so a per-query ranking (what the Triton engine's
+    own reference quota actually does -- see get_block_map's docstring) has
+    nowhere to go here. This is used only for the Light reference-protection
+    tier; Heavy Enforcement needs no ranking at all since every block in the
+    range qualifies regardless of score.
+
+    Returns block indices in [first, last), best score first.
+    """
+    pooled_q = mean_pool(qb, _CK_BLOCK).mean(dim=2, keepdim=True)   # (B,H,1,D)
+    mu = kb.mean(dim=1, dtype=torch.float32)
+    pooled_k = mean_pool(kb, _CK_BLOCK) - mu[:, :, None, :]         # (B,H,NK,D)
+    scores = (pooled_q @ pooled_k.transpose(-1, -2)) * qk_scale     # (B,H,1,NK)
+    scores = scores.mean(dim=(0, 1, 2))                             # (NK,) global
+    order = torch.argsort(scores[first:last], descending=True)
+    return (order + first).tolist()
+
+
+def _ck_protected_block_set(qb, kb, NK, prefix, protected_ranges,
+                            reference_ranges, reference_sparsity, qk_scale):
+    """Every key-block index that must be exact for this call, combining
+    prefix/audio protection AND reference protection into ONE set -- see
+    ``_ck_sol_attn``'s docstring for how this set becomes a single
+    contiguous ``sink_blocks`` range. Returns a sorted list, or ``None`` if
+    nothing needs protecting.
+    """
+    protected = set()
+    for first, last in get_protected_block_ranges(
+        prefix, protected_ranges, _CK_BLOCK, NK
+    ):
+        protected.update(range(first, last))
+
+    if reference_sparsity is not None:
+        for first, last in get_reference_quota_block_ranges(
+            reference_ranges, prefix, protected_ranges, _CK_BLOCK, NK
+        ):
+            block_count = last - first
+            keep = get_reference_quota_keep_count(block_count, reference_sparsity)
+            if keep <= 0:
+                continue
+            if keep >= block_count:
+                # Heavy Enforcement: every block in the range qualifies for
+                # every query already, so folding it into one global sink
+                # set is exact, not an approximation of anything.
+                protected.update(range(first, last))
+            else:
+                # Light: the Triton engine picks this PER query block (see
+                # get_block_map's docstring). sink_blocks is necessarily one
+                # set for the whole call, so this ranks blocks by a
+                # query-averaged score instead of a per-query one -- a real
+                # approximation, disclosed via the warning in _ck_sol_attn,
+                # not silently treated as equivalent.
+                top = _ck_rank_blocks_globally(qb, kb, first, last, qk_scale)
+                protected.update(top[:keep])
+
+    return sorted(protected) if protected else None
+
+
 def _ck_sol_attn(qb, kb, vb, topk_ratio, prefix, protected_ranges,
-                 reference_sparsity, stabilize_motion, qk_scale,
-                 tail_correction=True):
+                 reference_ranges, reference_sparsity, stabilize_motion,
+                 qk_scale, tail_correction=True):
     """Route through comfy_kitchen's real compiled sol_attn kernel (see
     Comfy-Org/ComfyUI PR #16072, comfy_kitchen>=0.2.32) instead of this
     package's own Triton path -- real CUDA int8 compute and a built-in
     pooled tail term (gated by ``tail_correction`` the same as the Triton
-    path, rather than always on), at the cost of three features this
-    engine's API cannot express, each silently disabled with a one-time
-    warning rather than an error (same "never cost the user their run"
-    policy as the rest of this file):
+    path, rather than always on).
 
-    - Only ONE contiguous sink range (``sink_blocks``), not the disjoint
-      prefix + reference-excluding spans ``protected_ranges`` supports here.
-      A multi-span request degrades to no protection at all -- approximating
-      it with a union bounding range risks silently making a huge
-      reference/video span "always exact", which is worse than an honest gap.
-    - No reference-quota tier: sol_attn has only the one sink range above,
-      nothing analogous to this file's separate ``reference_sparsity``.
-    - No ``stabilize_motion``: sol_attn's routing is stateless per call, with
-      no equivalent to this file's cross-step LUT stickiness.
+    ``sink_blocks`` only expresses ONE contiguous always-exact range, but
+    attention's output does not depend on the order of keys/values -- only
+    on which ones are attended and their values, since summing over the key
+    axis is order-invariant. So prefix protection, every span in
+    ``protected_ranges``, and reference protection are combined into one
+    key-block SET (``_ck_protected_block_set``), K and V are reordered
+    (same permutation applied to both) so that whole set is contiguous at
+    the front, and ``sink_blocks=[0, len(set))`` covers exactly that -- exact
+    for prefix/protect_ranges/Heavy Enforcement (all query-independent
+    already), an approximation only for the Light reference tier specifically
+    (see ``_ck_protected_block_set``'s docstring for why). No un-permutation
+    of the output is needed: query rows are never touched, only key/value
+    order, and attention is invariant to that.
+
+    ``stabilize_motion`` has no equivalent here regardless: sol_attn's
+    routing is stateless per call, with no analogue to this file's cross-step
+    LUT stickiness. Silently ignored with a one-time warning, same "never
+    cost the user their run" policy as the rest of this file.
     """
     import comfy_kitchen as ck   # ImportError -> caller's except -> dense()
 
-    if protected_ranges is not None:
-        _ck_warn_once(
-            "multi_range",
-            "protect_ranges has multiple spans; the comfy_kitchen engine "
-            "only supports one contiguous sink range, so prefix/audio "
-            "protection is OFF for this run. Use the custom (Triton) "
-            "engine if you need it.")
-        sink_blocks = [0, 0]
-    elif prefix > 0:
-        block = 64  # comfy_kitchen's sol_attn hardcodes a 64-token block
-        sink_blocks = [0, (prefix + block - 1) // block]
-    else:
-        sink_blocks = [0, 0]
-
-    if reference_sparsity is not None:
-        _ck_warn_once(
-            "reference_quota",
-            "reference_protection has no equivalent in the comfy_kitchen "
-            "engine and is ignored here. Use the custom (Triton) engine "
-            "for that feature.")
     if stabilize_motion:
         _ck_warn_once(
             "stabilize_motion",
             "stabilize_motion has no equivalent in the comfy_kitchen engine "
             "(routing is stateless per call) and is ignored here.")
+
+    B, LK, H, D = kb.shape
+    NK = (LK + _CK_BLOCK - 1) // _CK_BLOCK
+
+    protected_blocks = None
+    if protected_ranges is not None or prefix > 0 or reference_sparsity is not None:
+        if reference_sparsity is not None and reference_sparsity < 1.0:
+            _ck_warn_once(
+                "reference_light",
+                "reference_protection's Light tier is approximated here by "
+                "a query-averaged global ranking, not the Triton engine's "
+                "true per-query-block selection -- see "
+                "_ck_protected_block_set's docstring. Heavy Enforcement has "
+                "no such gap.")
+        protected_blocks = _ck_protected_block_set(
+            qb, kb, NK, prefix, protected_ranges, reference_ranges,
+            reference_sparsity, qk_scale,
+        )
+
+    if protected_blocks:
+        protected_set = set(protected_blocks)
+        rest = [b for b in range(NK) if b not in protected_set]
+        idx = torch.cat([
+            torch.arange(b * _CK_BLOCK, min(LK, (b + 1) * _CK_BLOCK), device=kb.device)
+            for b in (protected_blocks + rest)
+        ])
+        kb, vb = kb.index_select(1, idx), vb.index_select(1, idx)
+        sink_blocks = [0, len(protected_blocks)]
+    else:
+        sink_blocks = [0, 0]
 
     # The CUDA backend rejects anything that isn't literally bfloat16 --
     # NOT fp16, despite fp16 being "close enough" everywhere else in this
@@ -451,9 +551,9 @@ def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
 
             if use_ck:
                 out = _ck_sol_attn(qb, kb, vb, topk_ratio, prefix,
-                                   protected_ranges, reference_sparsity,
-                                   stabilize_motion, qk_scale,
-                                   tail_correction=tail_correction)
+                                   protected_ranges, reference_ranges,
+                                   reference_sparsity, stabilize_motion,
+                                   qk_scale, tail_correction=tail_correction)
                 # comfy_kitchen's sol_attn hardcodes a 64-token block; these
                 # are for the same run-summary stats the Triton path below
                 # reports, not a real selection this file made.
@@ -473,7 +573,31 @@ def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
                     # Only the bounded boundary slice is retained -- see
                     # block_map.py. Storing the full lut here is what made this
                     # grow to several GB per run at 768p with stabilize_motion on.
-                    state["prev_lut"][call_idx] = history
+                    #
+                    # This dict entry is exactly the pattern Comfy-Org/ComfyUI
+                    # #16148 fixed for their own VSA plan/pooled-stats caches:
+                    # a fresh tensor becoming long-lived by being stored for
+                    # the NEXT step's use, which the comfy compiler's malloc
+                    # graph treats as a rogue allocation and severs -- at a
+                    # real VRAM cost, every layer, every step. Mirroring
+                    # their fix exactly, not just pausing around it: allocate
+                    # the persistent buffer ONCE (paused), then update its
+                    # values in place with copy_() on every later call
+                    # (unpaused -- writing into an already-allocated fixed
+                    # address is exactly what graph replay needs, so it does
+                    # not need pausing). The shape check re-allocates if this
+                    # layer's history shape ever changes (a resolution or
+                    # sparsity change between runs reusing the same cached
+                    # model patch) rather than crashing on a mismatched
+                    # copy_(). This is a no-op fallback to the old
+                    # pause-every-call behaviour on older ComfyUI or with the
+                    # compiler disabled -- see the import guard above.
+                    cached = state["prev_lut"].get(call_idx)
+                    if cached is None or cached.shape != history.shape:
+                        with pause_malloc_graph():
+                            cached = torch.empty_like(history)
+                            state["prev_lut"][call_idx] = cached
+                    cached.copy_(history)
                     tail = rest[0] if tail_correction else None
                 else:
                     lut, topk, *rest = get_block_map(
@@ -495,19 +619,16 @@ def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
             state["seq"] = S
             state["kept"] = topk
             state["blocks"] = blocks
-            if use_ck:
-                # get_protected_block_ranges assumes a single-range or
-                # protect_ranges input; the comfy_kitchen path already
-                # collapsed to at most one range (or none) inside
-                # _ck_sol_attn, so recompute pinned count from that same
-                # decision rather than re-deriving it.
-                state["pinned"] = 0 if protected_ranges is not None else prefix
-            else:
-                state["pinned"] = sum(
-                    last - first for first, last in get_protected_block_ranges(
-                        prefix, protected_ranges, blkk, state["blocks"]
-                    )
+            # Same computation for both engines now that _ck_sol_attn
+            # actually protects multi-span protect_ranges too (see its
+            # docstring) -- just at comfy_kitchen's fixed 64-token block
+            # size for the ck branch instead of this run's blkk.
+            pinned_block_size = _CK_BLOCK if use_ck else blkk
+            state["pinned"] = sum(
+                last - first for first, last in get_protected_block_ranges(
+                    prefix, protected_ranges, pinned_block_size, state["blocks"]
                 )
+            )
 
             # [1, S, H, D] -> what the caller expects
             if skip_output_reshape:
@@ -517,20 +638,17 @@ def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
         except Exception as exc:  # noqa: BLE001 - a bad kernel must not kill the run
             if state["failed"] is None:
                 state["failed"] = "%s: %s" % (exc.__class__.__name__, exc)
-                if engine == "comfy_kitchen":
-                    # Visible on purpose, unlike the debug line below: this
-                    # engine is new and its failure mode is silent dense
-                    # fallback, which at typical sparsity is NOT far enough
-                    # from sparse speed to be obviously wrong from timing
-                    # alone -- exactly the "no speedup, unclear why" case
-                    # this is here to rule out.
-                    log.warning(
-                        "[H3Utils] comfy_kitchen engine failed, falling back "
-                        "to dense for the rest of this run: %s",
-                        state["failed"], exc_info=True,
-                    )
-                else:
-                    log.debug("[H3Utils] SLA kernel failed", exc_info=True)
+                # Visible on purpose, for every engine now, not just
+                # comfy_kitchen: every real mystery so far in this file's
+                # history turned out to be exactly this failing silently and
+                # falling to dense, which at typical sparsity is not far
+                # enough from sparse speed to be obviously wrong from timing
+                # alone. A debug-level log nobody sees is worse than no log.
+                log.warning(
+                    "[H3Utils] SLA kernel failed (engine=%s), falling back "
+                    "to dense for the rest of this run: %s",
+                    engine, state["failed"], exc_info=True,
+                )
             return dense()
 
     return override
@@ -946,12 +1064,19 @@ def patch_h3_sla(model, sparsity_ratio=0.90, block_size=64, min_seq_len=8192,
     this docstring applies to it. ``"comfy_kitchen"`` instead calls
     ``comfy_kitchen``'s real compiled sol_attn kernel (Comfy-Org/ComfyUI PR
     #16072, comfy-kitchen>=0.2.32) -- genuine CUDA int8 compute and a
-    pooled tail gated by ``tail_correction`` same as the Triton path, but it
-    cannot express multi-span ``protect_ranges``, ``reference_protection``,
-    or ``stabilize_motion``; see ``_ck_sol_attn``'s docstring for exactly
-    what happens to each when set. Both fall back to dense the same as any
-    other kernel failure if their kernel is unavailable or throws. A saved
-    workflow with the removed ``"hybrid"`` value is treated as ``"triton"``.
+    pooled tail gated by ``tail_correction`` same as the Triton path.
+    Prefix protection, every span in ``protect_ranges``, and reference
+    protection are all supported here too, by reordering K/V so the whole
+    protected set is contiguous and pointing sol_attn's single ``sink_blocks``
+    range at it -- exact for everything except the Light reference tier
+    specifically, which becomes a query-averaged approximation instead of
+    the Triton engine's true per-query-block selection; see
+    ``_ck_sol_attn``'s docstring for the reasoning. ``stabilize_motion`` has
+    no equivalent regardless (sol_attn's routing is stateless per call) and
+    is silently ignored with a one-time warning. Both engines fall back to
+    dense the same as any other kernel failure if their kernel is
+    unavailable or throws. A saved workflow with the removed ``"hybrid"``
+    value is treated as ``"triton"``.
     """
     if engine == "hybrid":
         log.warning(
