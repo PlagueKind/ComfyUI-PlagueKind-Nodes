@@ -1,11 +1,12 @@
 /**
- * LTX / MiniMax H3 LoRA Loader - Dynamic Height Edition (Android & Mobile Layout Hardened)
+ * MiniMax H3 RefMod Loader - LoRA-loader-style stack UI (Android & Mobile Layout Hardened)
  */
 import { app } from "../../scripts/app.js";
-const NODE_TYPE = "LTX_lora_loader";
-const MAX_SLOTS = 10;
-const MIN_SIZE = [420, 240];
-let _loraCache = ["None"];
+const NODE_TYPE = "H3_refmod_loader";
+const MAX_SLOTS = 8; // matches MiniMaxH3RefModsLoader.MAX_SLOTS
+const MIN_SIZE = [420, 200];
+const NONE = "(none)";
+let _modCache = [NONE];
 // Every on-canvas node instance registers a refresh callback here so its
 // dropdown/warning state can be updated live, without needing a new node
 // to be created or the page to be reloaded.
@@ -13,54 +14,54 @@ const _liveInstances = new Set();
 
 function _notifyLiveInstances() {
     for (const refresh of _liveInstances) {
-        try { refresh(); } catch (e) { console.warn("LoRA instance refresh failed", e); }
+        try { refresh(); } catch (e) { console.warn("RefMod instance refresh failed", e); }
     }
 }
 
-async function getLoraList(nodeData) {
+async function getModList(nodeData) {
     try {
-        const list = nodeData?.input?.hidden?.available_loras?.[0] || nodeData?.input?.required?.lora_name?.[0];
+        const list = nodeData?.input?.hidden?.available_mods?.[0];
         if (Array.isArray(list)) {
-            _loraCache = ["None", ...list];
+            _modCache = list.length ? list : [NONE];
             _notifyLiveInstances();
         }
-    } catch (e) { console.warn("LoRA fetch failed", e); }
+    } catch (e) { console.warn("RefMod fetch failed", e); }
 }
 
-function loraBasename(fullPath) {
-    if (!fullPath || fullPath === "None") return "None";
+function modBasename(fullPath) {
+    if (!fullPath || fullPath === NONE) return NONE;
     const base = fullPath.split(/[/\\]/).pop();
-    return base.replace(/\.[^.]+$/, "");
+    return base;
 }
 
-function loraFolder(fullPath) {
-    if (!fullPath || fullPath === "None") return "";
+function modFolder(fullPath) {
+    if (!fullPath || fullPath === NONE) return "";
     const parts = fullPath.split(/[/\\]/);
     return parts.length > 1 ? parts[parts.length - 2] : "";
 }
 
-function loraDisplayName(fullPath, allSlots) {
-    const name = loraBasename(fullPath);
-    if (!allSlots || fullPath === "None") return name;
+function modDisplayName(fullPath, allSlots) {
+    const name = modBasename(fullPath);
+    if (!allSlots || fullPath === NONE) return name;
     const siblings = allSlots.filter(s => {
-        const lora = s.getLora?.();
-        return lora && lora !== fullPath && loraBasename(lora) === name;
+        const mod = s.getMod?.();
+        return mod && mod !== fullPath && modBasename(mod) === name;
     });
     if (siblings.length > 0) {
-        const folder = loraFolder(fullPath);
+        const folder = modFolder(fullPath);
         return folder ? `${name} (${folder})` : name;
     }
     return name;
 }
 
 app.registerExtension({
-    name: "PlagueKind.LTX_lora_loader",
+    name: "PlagueKind.H3_refmod_loader",
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name !== NODE_TYPE) return;
         // Runs every time node defs are (re)registered, including on
         // "Refresh node definitions" -- not just when a new node instance
-        // is created -- so the dropdown cache actually picks up new loras.
-        await getLoraList(nodeData);
+        // is created -- so the dropdown cache actually picks up new mods.
+        await getModList(nodeData);
         const orig = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             orig?.apply(this, arguments);
@@ -85,24 +86,6 @@ app.registerExtension({
             if (stackWidget) {
                 stackWidget.computeSize = () => [0, -4];
                 stackWidget.draw = () => {};
-            }
-            const modeWidget = node.widgets.find(w => w.name === "mode");
-            function applyModeVisibility() {
-                const m = modeWidget ? modeWidget.value : "normal";
-                // MiniMax H3 loras seen so far carry no video_patch_proj/audio_patch_proj
-                // keys, so V/A are dead weight in that mode - keep them LTX-only for now.
-                const showVA = m === "ltx";
-                const showT = m === "minimax";
-                for (const s of slots) s.setVisibility?.(showVA, showT);
-                syncSize();
-            }
-            if (modeWidget) {
-                const origModeCallback = modeWidget.callback;
-                modeWidget.callback = function (...args) {
-                    const r = origModeCallback?.apply(this, args);
-                    applyModeVisibility();
-                    return r;
-                };
             }
             let initialData = [];
             try {
@@ -155,16 +138,16 @@ app.registerExtension({
             function refreshAllDisplayNames() {
                 for (const s of slots) s.refreshDisplayName?.();
             }
-            function refreshLoraState() {
+            function refreshModState() {
                 for (const s of slots) {
                     s.checkMissing?.();
                     s.refreshDisplayName?.();
                 }
             }
-            _liveInstances.add(refreshLoraState);
+            _liveInstances.add(refreshModState);
             const origOnRemoved = node.onRemoved;
             node.onRemoved = function () {
-                _liveInstances.delete(refreshLoraState);
+                _liveInstances.delete(refreshModState);
                 origOnRemoved?.apply(this, arguments);
             };
             function syncData() {
@@ -178,13 +161,13 @@ app.registerExtension({
             }
             async function refreshCache() {
                 try {
-                    const res = await fetch("/plaguekind/ltx_lora_loader/refresh", {
+                    const res = await fetch("/plaguekind/h3_refmod_loader/refresh", {
                         method: "GET",
                         headers: { "Content-Type": "application/json" }
                     });
                     const data = await res.json();
-                    if (data.loras) {
-                        _loraCache = ["None", ...data.loras];
+                    if (data.mods) {
+                        _modCache = data.mods.length ? data.mods : [NONE];
                         slots.forEach(s => s.checkMissing?.());
                     }
                 } catch (e) {
@@ -193,8 +176,8 @@ app.registerExtension({
             }
             function sortTree(items) {
                 items.sort((a, b) => {
-                    if (a.content === "None") return -1;
-                    if (b.content === "None") return 1;
+                    if (a.content === NONE) return -1;
+                    if (b.content === NONE) return 1;
                     if (a.has_submenu && !b.has_submenu) return -1;
                     if (!a.has_submenu && b.has_submenu) return 1;
                     return a.content.localeCompare(b.content);
@@ -207,9 +190,9 @@ app.registerExtension({
                 const root = [];
                 let noneAdded = false;
                 for (const item of list) {
-                    if (item === "None") {
+                    if (item === NONE) {
                         if (!noneAdded) {
-                            root.push({ content: "None", callback: () => onSelect("None") });
+                            root.push({ content: NONE, callback: () => onSelect(NONE) });
                             noneAdded = true;
                         }
                         continue;
@@ -232,14 +215,14 @@ app.registerExtension({
                 sortTree(root);
                 return root;
             }
-            function openLoraMenu(e, onSelect) {
-                const list = _loraCache;
+            function openModMenu(e, onSelect) {
+                const list = _modCache;
                 const searchIndex = [];
                 let noneAdded = false;
                 for (const item of list) {
-                    if (item === "None") {
+                    if (item === NONE) {
                         if (!noneAdded) {
-                            searchIndex.push({ display: "None", fullPath: "None", isFolder: false });
+                            searchIndex.push({ display: NONE, fullPath: NONE, isFolder: false });
                             noneAdded = true;
                         }
                         continue;
@@ -261,11 +244,11 @@ app.registerExtension({
                     const header = document.createElement("div");
                     header.style.cssText = "display:flex;justify-content:space-between;align-items:center;padding:5px 8px;border-bottom:1px solid #444;";
                     const box = document.createElement("input");
-                    box.placeholder = "Search LoRA...";
+                    box.placeholder = "Search RefMod...";
                     box.style.cssText = `flex:1;padding:4px;background:#222;color:white;border:1px solid #444;border-radius:4px;font-size:12px;`;
                     const refreshBtn = document.createElement("button");
                     refreshBtn.innerHTML = "🔄";
-                    refreshBtn.title = "Refresh LoRA Cache";
+                    refreshBtn.title = "Refresh RefMod Cache";
                     refreshBtn.style.cssText = "margin-left:6px;padding:2px 6px;background:#333;border:none;border-radius:3px;cursor:pointer;";
                     refreshBtn.onclick = (ev) => {
                         ev.stopPropagation();
@@ -343,11 +326,11 @@ app.registerExtension({
                     syncData();
                 });
             }
-            function addSlot(data = { on: true, lora: "None", str: 1.0, v: 1.0, a: 1.0, t: 1.0 }) {
+            function addSlot(data = { on: true, mod: NONE, str: 1.0, copies: 1 }) {
                 if (slots.length >= MAX_SLOTS) return;
                 // backfill fields missing from rows saved before this field existed,
-                // so a stale/partial row doesn't silently default a slider to 0
-                data = { on: true, lora: "None", str: 1.0, v: 1.0, a: 1.0, t: 1.0, ...data };
+                // so a stale/partial row doesn't silently default to 0
+                data = { on: true, mod: NONE, str: 1.0, copies: 1, ...data };
                 const row = document.createElement("div");
                 row.style.cssText = "display:flex;align-items:center;gap:6px;width:100%;min-height:28px;background:var(--comfy-menu-bg);padding:4px;border-radius:4px;border:1px solid var(--border-color);transition:all 0.15s ease;box-sizing:border-box;pointer-events:auto;";
 
@@ -371,7 +354,7 @@ app.registerExtension({
                 chk.style.flexShrink = "0";
 
                 function updateRowState() {
-                    const targets = [handle, sel, str.wrap, v.wrap, a.wrap, t.wrap, rm];
+                    const targets = [handle, sel, str.wrap, copies.wrap, rm];
                     if (chk.checked) {
                         row.style.opacity = "1";
                         row.style.filter = "none";
@@ -390,7 +373,7 @@ app.registerExtension({
 
                 const sel = document.createElement("div");
                 sel.setAttribute("role", "button");
-                sel.dataset.lora = data.lora;
+                sel.dataset.mod = data.mod;
                 sel.style.cssText = inputStyle + "flex-grow:1;min-width:0;width:0;flex-shrink:1;display:flex;align-items:center;justify-content:space-between;cursor:pointer;overflow:hidden;user-select:none;white-space:nowrap;";
 
                 sel.addEventListener("mouseenter", () => {
@@ -405,8 +388,8 @@ app.registerExtension({
                 });
 
                 const selText = document.createElement("span");
-                selText.textContent = loraDisplayName(data.lora, slots);
-                selText.title = data.lora;
+                selText.textContent = modDisplayName(data.mod, slots);
+                selText.title = data.mod;
                 selText.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex-grow:1;text-align:left;min-width:0;margin-right:4px;";
 
                 const warn = document.createElement("span");
@@ -414,19 +397,19 @@ app.registerExtension({
                 warn.style.cssText = "color:var(--error-text, #ff5555);font-size:11px;margin-right:2px;flex-shrink:0;display:none;font-weight:bold;";
 
                 function checkMissing() {
-                    const fullPath = sel.dataset.lora;
-                    if (!fullPath || fullPath === "None") {
+                    const fullPath = sel.dataset.mod;
+                    if (!fullPath || fullPath === NONE) {
                         warn.style.display = "none";
                         sel.style.borderColor = "var(--border-color)";
                         return;
                     }
 
                     const norm = p => p ? p.replace(/[/\\]/g, "/").toLowerCase() : "";
-                    const isMissing = !_loraCache.some(x => norm(x) === norm(fullPath));
+                    const isMissing = !_modCache.some(x => norm(x) === norm(fullPath));
 
                     if (isMissing) {
                         warn.style.display = "inline";
-                        warn.title = `File missing from environment:\n${fullPath}`;
+                        warn.title = `RefMod missing from environment (or ComfyUI-MiniMaxH3Mod isn't installed):\n${fullPath}`;
                         sel.style.borderColor = "var(--error-text, #ff5555)";
                     } else {
                         warn.style.display = "none";
@@ -441,9 +424,9 @@ app.registerExtension({
                 sel.append(warn, selText, arrow);
                 sel.onclick = (e) => {
                     if (!chk.checked) return;
-                    openLoraMenu(e, (fullPath) => {
-                        sel.dataset.lora = fullPath;
-                        selText.textContent = loraDisplayName(fullPath, slots);
+                    openModMenu(e, (fullPath) => {
+                        sel.dataset.mod = fullPath;
+                        selText.textContent = modDisplayName(fullPath, slots);
                         selText.title = fullPath;
                         checkMissing();
                         syncData();
@@ -481,19 +464,19 @@ app.registerExtension({
                         if (e.key === "Enter") ok.click();
                         if (e.key === "Escape") close();
                     });
-                        overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(); });
-                        btnRow.append(cancel, ok);
-                        panel.append(title, popInp, btnRow);
-                        overlay.appendChild(panel);
-                        document.body.appendChild(overlay);
-                        requestAnimationFrame(() => { popInp.focus(); popInp.select(); });
+                    overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(); });
+                    btnRow.append(cancel, ok);
+                    panel.append(title, popInp, btnRow);
+                    overlay.appendChild(panel);
+                    document.body.appendChild(overlay);
+                    requestAnimationFrame(() => { popInp.focus(); popInp.select(); });
                 }
-                function makeEffectiveTooltip(strInp, multInp, multLabel) {
-                    const s = parseFloat(strInp.value) || 0;
-                    const m = parseFloat(multInp.value) || 0;
-                    return `${multLabel.replace(":", "")} ${s.toFixed(2)} × ${m.toFixed(2)} = ${(s * m).toFixed(3)} (effective)`;
+                function makeEffectiveTooltip() {
+                    const s = parseFloat(str.inp.value) || 0;
+                    const c = parseInt(copies.inp.value) || 1;
+                    return `strength ${s.toFixed(2)}` + (c > 1 ? ` × ${c} copies` : "") + " (0 skips this mod)";
                 }
-                function num(val, label) {
+                function num(val, label, { integer = false, min = null, max = null } = {}) {
                     const wrap = document.createElement("div");
                     wrap.style.cssText = "display:flex;align-items:center;gap:2px;flex-shrink:0;";
                     const lbl = document.createElement("span");
@@ -501,43 +484,47 @@ app.registerExtension({
                     lbl.style.fontSize = "10px";
 
                     const inp = document.createElement("input");
-                    inp.type = "text"; inp.inputMode = "decimal"; inp.value = Number.isFinite(Number(val)) ? Number(val).toFixed(2) : "0.00";
+                    inp.type = "text"; inp.inputMode = "decimal";
+                    inp.value = integer
+                        ? (Number.isFinite(Number(val)) ? String(Math.round(Number(val))) : "1")
+                        : (Number.isFinite(Number(val)) ? Number(val).toFixed(2) : "0.00");
                     inp.style.cssText = inputStyle + "width:33px;text-align:center;flex-shrink:0;box-sizing:border-box;";
 
-                    inp.addEventListener("change", syncData);
+                    function clamp(v) {
+                        let n = integer ? Math.round(v) : v;
+                        if (min !== null) n = Math.max(min, n);
+                        if (max !== null) n = Math.min(max, n);
+                        return n;
+                    }
+
+                    inp.addEventListener("change", () => {
+                        const n = clamp(parseFloat(inp.value) || 0);
+                        inp.value = integer ? String(n) : n.toFixed(2);
+                        syncData();
+                    });
                     inp.addEventListener("input", syncData);
                     inp.addEventListener("click", (e) => {
                         if (!chk.checked) return;
                         e.preventDefault();
                         e.stopPropagation();
                         showNumPopup(inp.value, label, (newVal) => {
-                            inp.value = newVal.toFixed(2);
+                            const n = clamp(newVal);
+                            inp.value = integer ? String(n) : n.toFixed(2);
                             syncData();
                         });
                     });
                     wrap.append(lbl, inp);
                     return { wrap, inp };
                 }
-                const str = num(data.str, "S:");
-                const v = num(data.v, "V:");
-                const a = num(data.a, "A:");
-                const t = num(data.t, "T:");
-                function setVisibility(showVA, showT) {
-                    v.wrap.style.display = showVA ? "" : "none";
-                    a.wrap.style.display = showVA ? "" : "none";
-                    t.wrap.style.display = showT ? "" : "none";
-                }
+                const str = num(data.str, "S:", { min: 0, max: 1 });
+                const copies = num(data.copies, "x", { integer: true, min: 1, max: 10 });
                 function updateTooltips() {
-                    v.inp.title = makeEffectiveTooltip(str.inp, v.inp, "V") + " (no-op unless the LoRA has video-specific keys)";
-                    a.inp.title = makeEffectiveTooltip(str.inp, a.inp, "A") + " (no-op unless the LoRA has audio-specific keys)";
-                    t.inp.title = makeEffectiveTooltip(str.inp, t.inp, "T") + " (MiniMax H3 text I/O only - no effect on LTX loras)";
-                    str.inp.title = `S: ${(parseFloat(str.inp.value) || 0).toFixed(2)} (master strength)`;
+                    str.inp.title = makeEffectiveTooltip() + " (master strength, 0-1)";
+                    copies.inp.title = makeEffectiveTooltip() + " (copies to inject, 1-10 - each copy costs its full token count)";
                 }
                 updateTooltips();
                 str.inp.addEventListener("input", updateTooltips);
-                v.inp.addEventListener("input", updateTooltips);
-                a.inp.addEventListener("input", updateTooltips);
-                t.inp.addEventListener("input", updateTooltips);
+                copies.inp.addEventListener("input", updateTooltips);
 
                 const rm = document.createElement("button");
                 rm.innerHTML = "✖";
@@ -558,35 +545,31 @@ app.registerExtension({
                     row: row,
                     getValue: () => ({
                         on: chk.checked,
-                        lora: sel.dataset.lora,
+                        mod: sel.dataset.mod,
                         str: parseFloat(str.inp.value) || 0.0,
-                                     v: parseFloat(v.inp.value) || 0.0,
-                                     a: parseFloat(a.inp.value) || 0.0,
-                                     t: parseFloat(t.inp.value) || 0.0
+                        copies: parseInt(copies.inp.value) || 1
                     }),
-                    setVisibility: setVisibility,
-                    getLora: () => sel.dataset.lora,
-                      refreshDisplayName: () => {
-                          const lora = sel.dataset.lora;
-                          selText.textContent = loraDisplayName(lora, slots);
-                      },
-                      checkMissing: checkMissing,
-                      updateRowState: updateRowState,
-                      remove: () => { row.remove(); slots = slots.filter(s => s !== slotObj); syncData(); }
+                    getMod: () => sel.dataset.mod,
+                    refreshDisplayName: () => {
+                        const mod = sel.dataset.mod;
+                        selText.textContent = modDisplayName(mod, slots);
+                    },
+                    checkMissing: checkMissing,
+                    updateRowState: updateRowState,
+                    remove: () => { row.remove(); slots = slots.filter(s => s !== slotObj); syncData(); }
                 };
                 rm.onclick = slotObj.remove;
-                row.append(handle, chk, sel, str.wrap, v.wrap, a.wrap, t.wrap, rm);
+                row.append(handle, chk, sel, str.wrap, copies.wrap, rm);
                 slots.push(slotObj);
                 makeDraggable(row, slotObj);
                 container.appendChild(row);
 
                 checkMissing();
                 updateRowState();
-                applyModeVisibility();
                 syncData();
             }
             const addBtn = document.createElement("button");
-            addBtn.textContent = "＋ Add LoRA";
+            addBtn.textContent = "＋ Add RefMod";
             addBtn.style.cssText = inputStyle + "width:100%;cursor:pointer;font-weight:bold;transition:all 0.1s ease;pointer-events:auto;";
 
             addBtn.addEventListener("mouseenter", () => {
@@ -600,7 +583,7 @@ app.registerExtension({
 
             addBtn.onclick = () => addSlot();
             container.appendChild(addBtn);
-            const uiWidget = node.addDOMWidget("lora_ui", "HTML", container);
+            const uiWidget = node.addDOMWidget("refmod_ui", "HTML", container);
             // Without this, LiteGraph reserves its default ~fixed slot height
             // for the widget and node.computeSize() never reflects the real
             // content -- that's what was clipping the bottom padding and
