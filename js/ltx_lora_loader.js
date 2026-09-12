@@ -152,6 +152,16 @@ app.registerExtension({
                     (app.canvas || node.graph?.list_of_graphcanvas?.[0])?.setDirty(true, true);
                 });
             }
+            // On workflow load, _origConfigure applies whatever size was
+            // last saved (which can be stale/oversized) and this runs once
+            // to correct it - but if that single pass lands before the
+            // node's real layout has settled, the wrong value just sticks
+            // with nothing to re-check it. This adds a delayed second pass
+            // as a safety net for that race.
+            function scheduleResize() {
+                syncSize();
+                setTimeout(syncSize, 50);
+            }
             function refreshAllDisplayNames() {
                 for (const s of slots) s.refreshDisplayName?.();
             }
@@ -614,7 +624,7 @@ app.registerExtension({
                 return [width, container.scrollHeight + 4];
             };
             initialData.forEach(d => addSlot(d));
-            requestAnimationFrame(syncSize);
+            scheduleResize();
             const _origConfigure = node.configure;
             node.configure = function (data) {
                 if (_origConfigure) _origConfigure.call(node, data);
@@ -625,7 +635,7 @@ app.registerExtension({
                     if (stackWidget) stackWidget.value = raw;
                     JSON.parse(raw).forEach(d => addSlot(d));
                 } catch {}
-                requestAnimationFrame(syncSize);
+                scheduleResize();
             };
         };
     }
