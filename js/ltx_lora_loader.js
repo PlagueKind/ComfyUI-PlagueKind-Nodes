@@ -65,14 +65,10 @@ app.registerExtension({
         nodeType.prototype.onNodeCreated = function () {
             orig?.apply(this, arguments);
             const node = this;
-            // Real min height is driven by the DOM widget's own computeSize
-            // (set below, from container.scrollHeight) rather than a guessed
-            // row-count formula -- guessed heights drift from reality as soon
-            // as rows wrap (narrow nodes, mobile) and clip the container's
-            // bottom padding.
+            const ROW_H = 40;
+            const BTN_H = 60;
             function minHeight() {
-                const natural = node.computeSize();
-                return Math.max(MIN_SIZE[1], natural[1]);
+                return Math.max(MIN_SIZE[1], (slots.length * ROW_H) + BTN_H);
             }
             node.onResize = function (size) {
                 size[0] = Math.max(MIN_SIZE[0], size[0]);
@@ -112,15 +108,12 @@ app.registerExtension({
             const container = document.createElement("div");
             Object.assign(container.style, {
                 display: "flex", flexDirection: "column", gap: "6px",
-                width: "100%", padding: "8px", boxSizing: "border-box",
+                width: "100%", padding: "8px 8px 18px 8px", boxSizing: "border-box",
                 fontFamily: "var(--font)", color: "var(--fg-color)",
-                // The overlay's bounding box can end up a few px off from
-                // where the canvas/header actually renders (most visible in
-                // ComfyUI's Vue-node mode, which offsets the node body by
-                // the header height in a way this DOM overlay isn't told
-                // about). Making empty container space click-through means
-                // that mismatch can never swallow a header/collapse click -
-                // only the actual controls (rows, add button) opt back in.
+                // Keep empty container space click-through so this overlay
+                // can never swallow a click meant for the node's title bar/
+                // collapse button underneath it - only the actual controls
+                // (rows, add button) opt back in below.
                 pointerEvents: "none"
             });
             const inputStyle = `
@@ -134,33 +127,22 @@ app.registerExtension({
             `;
             let slots = [];
             let _rafPending = false;
+            const HEADER = 58; // LiteGraph title bar + widget chrome
+            function applySize() {
+                const targetH = Math.max(MIN_SIZE[1], slots.length * ROW_H + BTN_H + HEADER);
+                node.setSize([Math.max(node.size[0], MIN_SIZE[0]), targetH]);
+            }
             function syncSize() {
+                // Apply immediately - no one-frame lag - then run a trailing
+                // rAF pass to coalesce any rapid-fire follow-up calls (e.g.
+                // several slots added back-to-back on configure/load).
+                applySize();
                 if (_rafPending) return;
                 _rafPending = true;
                 requestAnimationFrame(() => {
                     _rafPending = false;
-                    // node.computeSize() sums every widget's own computeSize(),
-                    // including uiWidget's below (real container.scrollHeight) --
-                    // so this always matches actual DOM content, not a guess.
-                    const natural = node.computeSize();
-                    // Always snap to what the content actually needs (not
-                    // Math.max'd against the node's current size) - that's
-                    // what lets removing a row shrink the node back down
-                    // instead of only ever being able to grow.
-                    const targetH = Math.max(MIN_SIZE[1], natural[1]);
-                    node.setSize([Math.max(node.size[0], MIN_SIZE[0]), targetH]);
-                    (app.canvas || node.graph?.list_of_graphcanvas?.[0])?.setDirty(true, true);
+                    applySize();
                 });
-            }
-            // On workflow load, _origConfigure applies whatever size was
-            // last saved (which can be stale/oversized) and this runs once
-            // to correct it - but if that single pass lands before the
-            // node's real layout has settled, the wrong value just sticks
-            // with nothing to re-check it. This adds a delayed second pass
-            // as a safety net for that race.
-            function scheduleResize() {
-                syncSize();
-                setTimeout(syncSize, 50);
             }
             function refreshAllDisplayNames() {
                 for (const s of slots) s.refreshDisplayName?.();
@@ -610,21 +592,9 @@ app.registerExtension({
 
             addBtn.onclick = () => addSlot();
             container.appendChild(addBtn);
-            const uiWidget = node.addDOMWidget("lora_ui", "HTML", container);
-            // Without this, LiteGraph reserves its default ~fixed slot height
-            // for the widget and node.computeSize() never reflects the real
-            // content -- that's what was clipping the bottom padding and
-            // making the node refuse to grow/shrink with the row count.
-            uiWidget.computeSize = (width) => {
-                // Mirror the same "-4 hides it" trick already used for
-                // stackWidget above: when the node is collapsed, report a
-                // near-zero size so the DOM overlay actually disappears
-                // instead of hanging below the collapsed title bar.
-                if (node.flags?.collapsed) return [width, -4];
-                return [width, container.scrollHeight + 4];
-            };
+            node.addDOMWidget("lora_ui", "HTML", container);
             initialData.forEach(d => addSlot(d));
-            scheduleResize();
+            requestAnimationFrame(syncSize);
             const _origConfigure = node.configure;
             node.configure = function (data) {
                 if (_origConfigure) _origConfigure.call(node, data);
@@ -635,7 +605,7 @@ app.registerExtension({
                     if (stackWidget) stackWidget.value = raw;
                     JSON.parse(raw).forEach(d => addSlot(d));
                 } catch {}
-                scheduleResize();
+                requestAnimationFrame(syncSize);
             };
         };
     }

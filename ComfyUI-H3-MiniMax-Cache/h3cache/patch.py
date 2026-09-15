@@ -270,7 +270,9 @@ def run_h3_blocks(
     )
     for index in range(start, end):
         block = model.blocks[index]
-        comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, hidden_states.device, block)
+        comfy.model_prefetch.prefetch_queue_pop(
+            prefetch_queue, hidden_states.device, block, malloc_scope="block"
+        )
         if ("double_block", index) in blocks_replace:
 
             def block_wrapper(block_args: dict[str, Any]) -> dict[str, torch.Tensor]:
@@ -304,7 +306,7 @@ def run_h3_blocks(
             )
     if prefetch_queue is not None:
         comfy.model_prefetch.prefetch_queue_pop(
-            prefetch_queue, hidden_states.device, None
+            prefetch_queue, hidden_states.device, None, malloc_scope="block"
         )
     return hidden_states
 
