@@ -1,9 +1,15 @@
 """ComfyUI-H3-SLA-Attention.
 
-One node, H3 SLA Attention, which gives MiniMax-H3 the block-sparse attention
-backend that ComfyUI does not otherwise have -- the inference path the lightx2v
-SLA turbo LoRA was distilled against, and the reason that LoRA produces no
-speedup on its own. See README.md.
+H3 SLA Attention gives MiniMax-H3 the block-sparse attention backend that
+ComfyUI does not otherwise have -- the inference path the lightx2v SLA turbo
+LoRA was distilled against, and the reason that LoRA produces no speedup on
+its own. H3 Adaptive Feed Forward is a separate, orthogonal MODEL patch --
+see its own module docstring for why it exists, what it does and does not
+overlap with H3SLAAttention, and why it does not reimplement kijai's
+del-based low-VRAM attention restructuring (current ComfyUI's
+AttentionTensorContainer already does the equivalent for any
+optimized_attention_override node, including H3SLAAttention, automatically).
+See README.md.
 
 Registration is deliberately defensive: if anything in this package fails to
 import -- missing Triton, an unsupported GPU, a ComfyUI API change -- we log the
@@ -27,10 +33,11 @@ try:
     from comfy_api.latest import ComfyExtension
 
     from .sla_node import H3SLAAttention
+    from .h3_adaptive_feedforward import H3AdaptiveFeedForward
 
     class H3SLAExtension(ComfyExtension):
         async def get_node_list(self):
-            return [H3SLAAttention]
+            return [H3SLAAttention, H3AdaptiveFeedForward]
 
     _EXTENSION = H3SLAExtension
 except Exception:  # noqa: BLE001 - never block ComfyUI startup

@@ -253,6 +253,10 @@ def _new_state():
         "fp16_saved": None,     # (fp16, bf16) matmul reduction flags to restore
         "call_idx": 0,       # this step's call count, for stabilize_motion
         "prev_lut": {},      # call_idx -> last sparse lut, for stabilize_motion
+        "ck_reorder": None,  # cached (NK, LK, idx, sink_blocks) for the
+                              # comfy_kitchen engine's protected-block reorder,
+                              # when it's actually run-invariant (see
+                              # _ck_sol_attn's `cacheable` check below).
     }
 
 
@@ -274,6 +278,7 @@ def _reset_run_state(state):
     # stabilize_motion's held tensors from the abandoned run would otherwise
     # sit in VRAM until this next-run detection fires here.
     state["prev_lut"].clear()
+    state["ck_reorder"] = None
 
 
 def _summarise(state, sparsity, blkq, blkk):
@@ -375,7 +380,7 @@ def _ck_protected_block_set(qb, kb, NK, prefix, protected_ranges,
 
 def _ck_sol_attn(qb, kb, vb, topk_ratio, prefix, protected_ranges,
                  reference_ranges, reference_sparsity, stabilize_motion,
-                 qk_scale, tail_correction=True):
+                 qk_scale, tail_correction=True, state=None):
     """Route through comfy_kitchen's real compiled sol_attn kernel (see
     Comfy-Org/ComfyUI PR #16072, comfy_kitchen>=0.2.32) instead of this
     package's own Triton path -- real CUDA int8 compute and a built-in
@@ -396,6 +401,30 @@ def _ck_sol_attn(qb, kb, vb, topk_ratio, prefix, protected_ranges,
     of the output is needed: query rows are never touched, only key/value
     order, and attention is invariant to that.
 
+    ``state``, when given, caches the reorder ``idx``/``sink_blocks`` across
+    calls within one run. Whenever the protected set is NOT the Light
+    reference tier, it depends only on the fixed H3 payload layout
+    (``prefix``/``protected_ranges``/Heavy Enforcement's ranges are all
+    content-independent) -- so it is identical on every one of the ~50-something
+    layers and every step of the same generation, yet was previously being
+    rebuilt from scratch (a Python set, a list comprehension over up to
+    ~NK blocks, a fresh ``torch.arange``/``torch.cat``) on every single one
+    of those calls. Cached here instead, invalidated whenever ``NK``/``LK``
+    change (a resolution change reusing the same patched clone) or by the
+    caller's own per-run reset. The Light tier is deliberately excluded from
+    the cache: its ranking depends on this call's actual Q/K content
+    (``_ck_rank_blocks_globally``), so it must be recomputed every call
+    regardless -- caching it would silently freeze the "best-scoring 20%"
+    of the reference range to whatever the first call happened to pick.
+
+    This does not reduce the K/V reorder itself -- ``kb``/``vb`` differ by
+    layer, so the actual ``index_select`` copy still runs every call. That
+    cost is structural: ``sol_attn`` only accepts one contiguous sink range,
+    so protecting a non-contiguous token set requires physically reordering
+    K/V into one first. Fixing that would mean a ``sol_attn`` that accepts
+    an arbitrary index list instead of a single range -- a comfy_kitchen
+    change, not something this file's Python glue can route around.
+
     ``stabilize_motion`` has no equivalent here regardless: sol_attn's
     routing is stateless per call, with no analogue to this file's cross-step
     LUT stickiness. Silently ignored with a one-time warning, same "never
@@ -412,32 +441,58 @@ def _ck_sol_attn(qb, kb, vb, topk_ratio, prefix, protected_ranges,
     B, LK, H, D = kb.shape
     NK = (LK + _CK_BLOCK - 1) // _CK_BLOCK
 
-    protected_blocks = None
-    if protected_ranges is not None or prefix > 0 or reference_sparsity is not None:
-        if reference_sparsity is not None and reference_sparsity < 1.0:
-            _ck_warn_once(
-                "reference_light",
-                "reference_protection's Light tier is approximated here by "
-                "a query-averaged global ranking, not the Triton engine's "
-                "true per-query-block selection -- see "
-                "_ck_protected_block_set's docstring. Heavy Enforcement has "
-                "no such gap.")
-        protected_blocks = _ck_protected_block_set(
-            qb, kb, NK, prefix, protected_ranges, reference_ranges,
-            reference_sparsity, qk_scale,
-        )
+    # Only cacheable when nothing about the reorder depends on this call's
+    # actual content. reference_sparsity in (None, 0.0) covers Off and Heavy
+    # Enforcement respectively -- both purely layout-driven. Anything else
+    # (the Light tier) ranks blocks by score every call and must not be
+    # reused across layers.
+    cacheable = (
+        state is not None
+        and (reference_sparsity is None or reference_sparsity <= 0.0)
+    )
+    cached = state.get("ck_reorder") if cacheable else None
 
-    if protected_blocks:
-        protected_set = set(protected_blocks)
-        rest = [b for b in range(NK) if b not in protected_set]
-        idx = torch.cat([
-            torch.arange(b * _CK_BLOCK, min(LK, (b + 1) * _CK_BLOCK), device=kb.device)
-            for b in (protected_blocks + rest)
-        ])
-        kb, vb = kb.index_select(1, idx), vb.index_select(1, idx)
-        sink_blocks = [0, len(protected_blocks)]
+    if cached is not None and cached[0] == NK and cached[1] == LK:
+        idx, sink_blocks = cached[2], cached[3]
     else:
-        sink_blocks = [0, 0]
+        protected_blocks = None
+        if protected_ranges is not None or prefix > 0 or reference_sparsity is not None:
+            if reference_sparsity is not None and 0.0 < reference_sparsity < 1.0:
+                _ck_warn_once(
+                    "reference_light",
+                    "reference_protection's Light tier is approximated here by "
+                    "a query-averaged global ranking, not the Triton engine's "
+                    "true per-query-block selection -- see "
+                    "_ck_protected_block_set's docstring. Heavy Enforcement has "
+                    "no such gap.")
+            protected_blocks = _ck_protected_block_set(
+                qb, kb, NK, prefix, protected_ranges, reference_ranges,
+                reference_sparsity, qk_scale,
+            )
+
+        if protected_blocks:
+            protected_set = set(protected_blocks)
+            rest = [b for b in range(NK) if b not in protected_set]
+            # Guarded the same way prev_lut's one-time allocation is
+            # guarded below: this only runs once per run (cache miss), but
+            # "once" is exactly what trips up a captured/replayed graph if
+            # it isn't told to ignore this allocation -- see this file's
+            # own prev_lut comment for the full reasoning.
+            with pause_malloc_graph():
+                idx = torch.cat([
+                    torch.arange(b * _CK_BLOCK, min(LK, (b + 1) * _CK_BLOCK), device=kb.device)
+                    for b in (protected_blocks + rest)
+                ])
+            sink_blocks = [0, len(protected_blocks)]
+        else:
+            idx = None
+            sink_blocks = [0, 0]
+
+        if cacheable:
+            state["ck_reorder"] = (NK, LK, idx, sink_blocks)
+
+    if idx is not None:
+        kb, vb = kb.index_select(1, idx), vb.index_select(1, idx)
 
     # The CUDA backend rejects anything that isn't literally bfloat16 --
     # NOT fp16, despite fp16 being "close enough" everywhere else in this
@@ -553,7 +608,8 @@ def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
                 out = _ck_sol_attn(qb, kb, vb, topk_ratio, prefix,
                                    protected_ranges, reference_ranges,
                                    reference_sparsity, stabilize_motion,
-                                   qk_scale, tail_correction=tail_correction)
+                                   qk_scale, tail_correction=tail_correction,
+                                   state=state)
                 # comfy_kitchen's sol_attn hardcodes a 64-token block; these
                 # are for the same run-summary stats the Triton path below
                 # reports, not a real selection this file made.

@@ -58,10 +58,26 @@ class H3CacheState:
         self.device = device
         self.verbose = verbose
         self.total_steps = 1
+        self._residual_buffer: torch.Tensor | None = None
+        self._cache_valid = False
         self.reset()
 
     def reset(self) -> None:
-        self.cached_residual: torch.Tensor | None = None
+        # Deliberately do NOT drop/free self._residual_buffer here. This
+        # method runs inside H3CacheSamplingScope's `finally` (via finish())
+        # as well as mid-generation on a layout change -- i.e. it can run
+        # after comfy.model_prefetch's malloc_scope="block" region for the
+        # block stack has already been torn down / recycled. Letting the
+        # buffer's refcount hit zero at that point (the old code's
+        # `del residual`) frees a tensor whose storage may be associated
+        # with an already-closed scope, which is what produced the CUDA
+        # invalid-argument abort in cuMemFreeAsync. Instead we just mark the
+        # cache logically empty and keep reusing the same buffer in-place
+        # (see _store_residual). It only ever gets released via ordinary
+        # Python GC when this whole H3CacheState -- and the model patcher
+        # that owns it -- is discarded during a normal model unload, which
+        # comfy's own memory manager controls and expects.
+        self._cache_valid = False
         self.previous_feature_signature: torch.Tensor | None = None
         self.layout_signature: tuple[Any, ...] | None = None
         self.last_seen_timestep: float | None = None
@@ -106,8 +122,8 @@ class H3CacheState:
         if not signatures:
             stride = max(1, hidden_states.shape[0] // 100)
             sampled = hidden_states[::stride, :max_dim]
-            return sampled.detach().abs().mean(dim=-1).clone()
-        return torch.cat(signatures).clone()
+            return sampled.detach().abs().mean(dim=-1).float().cpu()
+        return torch.cat(signatures).float().cpu()
 
     @staticmethod
     def _timestep_value(timestep: Any) -> float | None:
@@ -119,21 +135,39 @@ class H3CacheState:
             return float(timestep)
         return None
 
+    @property
+    def cached_residual(self) -> torch.Tensor | None:
+        return self._residual_buffer if self._cache_valid else None
+
     def _store_residual(self, residual: torch.Tensor) -> None:
         if self.device == "cuda" and residual.device.type != "cuda":
             raise ValueError(
                 "H3 MiniMax Cache device is set to cuda, but the model is not running on CUDA."
             )
 
+        target_device = torch.device("cpu") if self.device == "cpu" else residual.device
+        residual = residual.detach()
         try:
-            if self.device == "cpu":
-                self.cached_residual = residual.detach().to("cpu", copy=True)
-            else:
-                self.cached_residual = residual.detach().clone()
+            buf = self._residual_buffer
+            # Overwrite the existing buffer in place instead of freeing it
+            # and allocating a new one every RUN step. A realloc is only
+            # needed on the first store or when shape/dtype/device actually
+            # changes (e.g. after a layout change already called reset()).
+            # copy_() into a stable, long-lived buffer never triggers the
+            # free-of-scoped-memory path that reset() used to hit.
+            if (buf is None or buf.shape != residual.shape or buf.dtype != residual.dtype
+                    or buf.device != target_device):
+                self._residual_buffer = torch.empty(
+                    residual.shape, dtype=residual.dtype, device=target_device
+                )
+                buf = self._residual_buffer
+            buf.copy_(residual, non_blocking=(target_device.type == "cuda"))
+            self._cache_valid = True
         except torch.OutOfMemoryError:
             if self.device == "cuda":
                 raise
-            self.cached_residual = residual.detach().to("cpu", copy=True)
+            self._residual_buffer = residual.to("cpu", copy=True)
+            self._cache_valid = True
 
     def _apply_residual(self, hidden_states: torch.Tensor) -> torch.Tensor:
         residual = self.cached_residual
@@ -219,7 +253,7 @@ class H3CacheState:
 
         self.run_count += 1
         self.consecutive_skips = 0
-        self.cached_residual = None
+        self._cache_valid = False
         self.previous_feature_signature = self._feature_signature(hidden_states, cache_ranges)
         start_hidden_states = hidden_states.clone()
         result = original_block(args)
