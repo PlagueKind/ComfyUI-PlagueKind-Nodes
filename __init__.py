@@ -86,6 +86,18 @@ for root, dirs, files in os.walk(current_dir):
                         NODE_CLASS_MAPPINGS.update(module.NODE_CLASS_MAPPINGS)
                     if hasattr(module, "NODE_DISPLAY_NAME_MAPPINGS"):
                         NODE_DISPLAY_NAME_MAPPINGS.update(module.NODE_DISPLAY_NAME_MAPPINGS)
+                    # Single-file V3 node modules (io.ComfyNode + comfy_entrypoint,
+                    # no NODE_CLASS_MAPPINGS) - same handling as
+                    # _load_extension_package, just without a real sub-package.
+                    entrypoint = getattr(module, "comfy_entrypoint", None)
+                    if entrypoint is not None:
+                        extension = _run_async(entrypoint())
+                        node_classes = _run_async(extension.get_node_list())
+                        for cls in node_classes:
+                            schema = cls.define_schema()
+                            NODE_CLASS_MAPPINGS[schema.node_id] = cls
+                            NODE_DISPLAY_NAME_MAPPINGS[schema.node_id] = (
+                                schema.display_name or schema.node_id)
             except Exception as e:
                 print(f"[PlagueKind-Nodes] Failed to load {file} from {root}: {e}")
 
