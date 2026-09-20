@@ -54,9 +54,13 @@ def _list_refmod_names_with_none():
         return [_FALLBACK_NONE]
 
 
+_COMPONENT_CHOICES = ("All", "Visual", "Audio")
+
+
 def _rows_to_kwargs(rows, cls, show_info, max_total_tokens):
-    """Translate our [{on, mod, str, copies}, ...] rows into their mod_i/
-    strength_i/copies_i keyword schema, padding unused slots with (none)."""
+    """Translate our [{on, mod, str, copies, components, vstr, astr}, ...]
+    rows into their mod_i/strength_i/copies_i/components_i/visual_strength_i/
+    audio_strength_i keyword schema, padding unused slots with (none)."""
     none_name = _none_sentinel(cls)
     max_slots = _max_slots(cls)
     kwargs = {"show_info": bool(show_info), "max_total_tokens": int(max_total_tokens)}
@@ -76,9 +80,17 @@ def _rows_to_kwargs(rows, cls, show_info, max_total_tokens):
             overflow += 1
             continue
         slot += 1
+        components = row.get("components", "All")
+        if components not in _COMPONENT_CHOICES:
+            components = "All"
+        visual_strength = max(0.0, min(1.0, float(row.get("vstr", 1.0))))
+        audio_strength = max(0.0, min(1.0, float(row.get("astr", 1.0))))
         kwargs[f"mod_{slot}"] = mod_name
         kwargs[f"strength_{slot}"] = strength
         kwargs[f"copies_{slot}"] = max(1, min(10, int(row.get("copies", 1))))
+        kwargs[f"components_{slot}"] = components
+        kwargs[f"visual_strength_{slot}"] = visual_strength
+        kwargs[f"audio_strength_{slot}"] = audio_strength
 
     if overflow:
         print(f"[PlagueKind | H3_refmod_loader] {overflow} extra enabled row(s) ignored - "
@@ -88,6 +100,9 @@ def _rows_to_kwargs(rows, cls, show_info, max_total_tokens):
         kwargs[f"mod_{i}"] = none_name
         kwargs[f"strength_{i}"] = 1.0
         kwargs[f"copies_{i}"] = 1
+        kwargs[f"components_{i}"] = "All"
+        kwargs[f"visual_strength_{i}"] = 1.0
+        kwargs[f"audio_strength_{i}"] = 1.0
 
     return kwargs
 

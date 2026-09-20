@@ -4,7 +4,7 @@
 import { app } from "../../scripts/app.js";
 const NODE_TYPE = "H3_refmod_loader";
 const MAX_SLOTS = 8; // matches MiniMaxH3RefModsLoader.MAX_SLOTS
-const MIN_SIZE = [420, 240];
+const MIN_SIZE = [560, 240];
 const NONE = "(none)";
 let _modCache = [NONE];
 // Every on-canvas node instance registers a refresh callback here so its
@@ -318,11 +318,11 @@ app.registerExtension({
                     syncData();
                 });
             }
-            function addSlot(data = { on: true, mod: NONE, str: 1.0, copies: 1 }) {
+            function addSlot(data = { on: true, mod: NONE, str: 1.0, copies: 1, components: "All", vstr: 1.0, astr: 1.0 }) {
                 if (slots.length >= MAX_SLOTS) return;
                 // backfill fields missing from rows saved before this field existed,
                 // so a stale/partial row doesn't silently default to 0
-                data = { on: true, mod: NONE, str: 1.0, copies: 1, ...data };
+                data = { on: true, mod: NONE, str: 1.0, copies: 1, components: "All", vstr: 1.0, astr: 1.0, ...data };
                 const row = document.createElement("div");
                 row.style.cssText = "display:flex;align-items:center;gap:6px;width:100%;min-height:28px;background:var(--comfy-menu-bg);padding:4px;border-radius:4px;border:1px solid var(--border-color);transition:all 0.15s ease;box-sizing:border-box;pointer-events:auto;";
 
@@ -346,7 +346,7 @@ app.registerExtension({
                 chk.style.flexShrink = "0";
 
                 function updateRowState() {
-                    const targets = [handle, sel, str.wrap, copies.wrap, rm];
+                    const targets = [handle, sel, str.wrap, copies.wrap, comp, vstr.wrap, astr.wrap, rm];
                     if (chk.checked) {
                         row.style.opacity = "1";
                         row.style.filter = "none";
@@ -510,13 +510,37 @@ app.registerExtension({
                 }
                 const str = num(data.str, "S:", { min: 0, max: 1 });
                 const copies = num(data.copies, "x", { integer: true, min: 1, max: 10 });
+                const vstr = num(data.vstr, "V:", { min: 0, max: 1 });
+                const astr = num(data.astr, "A:", { min: 0, max: 1 });
+
+                const COMPONENT_CYCLE = ["All", "Visual", "Audio"];
+                function compLabel(v) {
+                    return v === "Visual" ? "Vis" : v === "Audio" ? "Aud" : "All";
+                }
+                const comp = document.createElement("button");
+                comp.dataset.value = COMPONENT_CYCLE.includes(data.components) ? data.components : "All";
+                comp.textContent = compLabel(comp.dataset.value);
+                comp.title = "Components to load from this RefMod: All / Visual / Audio (click to cycle)";
+                comp.style.cssText = inputStyle + "width:34px;flex-shrink:0;cursor:pointer;font-size:9px;padding:2px 2px;";
+                comp.onclick = () => {
+                    if (!chk.checked) return;
+                    const next = COMPONENT_CYCLE[(COMPONENT_CYCLE.indexOf(comp.dataset.value) + 1) % COMPONENT_CYCLE.length];
+                    comp.dataset.value = next;
+                    comp.textContent = compLabel(next);
+                    syncData();
+                };
+
                 function updateTooltips() {
                     str.inp.title = makeEffectiveTooltip() + " (master strength, 0-1)";
                     copies.inp.title = makeEffectiveTooltip() + " (copies to inject, 1-10 - each copy costs its full token count)";
+                    vstr.inp.title = "visual_strength - multiplies master strength for this mod's visual/image reference (0-1)";
+                    astr.inp.title = "audio_strength - multiplies master strength for this mod's audio reference (0-1)";
                 }
                 updateTooltips();
                 str.inp.addEventListener("input", updateTooltips);
                 copies.inp.addEventListener("input", updateTooltips);
+                vstr.inp.addEventListener("input", updateTooltips);
+                astr.inp.addEventListener("input", updateTooltips);
 
                 const rm = document.createElement("button");
                 rm.innerHTML = "✖";
@@ -539,7 +563,10 @@ app.registerExtension({
                         on: chk.checked,
                         mod: sel.dataset.mod,
                         str: parseFloat(str.inp.value) || 0.0,
-                        copies: parseInt(copies.inp.value) || 1
+                        copies: parseInt(copies.inp.value) || 1,
+                        components: comp.dataset.value,
+                        vstr: parseFloat(vstr.inp.value) || 0.0,
+                        astr: parseFloat(astr.inp.value) || 0.0
                     }),
                     getMod: () => sel.dataset.mod,
                     refreshDisplayName: () => {
@@ -551,7 +578,7 @@ app.registerExtension({
                     remove: () => { row.remove(); slots = slots.filter(s => s !== slotObj); syncData(); }
                 };
                 rm.onclick = slotObj.remove;
-                row.append(handle, chk, sel, str.wrap, copies.wrap, rm);
+                row.append(handle, chk, sel, str.wrap, copies.wrap, comp, vstr.wrap, astr.wrap, rm);
                 slots.push(slotObj);
                 makeDraggable(row, slotObj);
                 container.appendChild(row);
