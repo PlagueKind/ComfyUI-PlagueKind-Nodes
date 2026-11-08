@@ -129,6 +129,7 @@ function resolveTarget(graph, id, slot, { depth = 0, crossInward = true } = {}) 
 // happens to produce the value -- crossInward: false.
 function describeOrigin(node, slotIndex) {
   const slot = node.inputs[slotIndex];
+  if (!node.graph) return null; // mid-clone (subgraph conversion)
   const link = slot && node.graph.links[slot.link];
   if (!link) {
     console.warn("[BundleNodes] describeOrigin: no link on slot", { node: node.id, slotIndex, slotLink: slot?.link });
@@ -151,6 +152,7 @@ function describeOrigin(node, slotIndex) {
 function describeTarget(node, slotIndex) {
   const slot = node.outputs[slotIndex];
   const linkIds = slot?.links;
+  if (!node.graph) return null; // mid-clone (subgraph conversion)
   if (!linkIds || !linkIds.length) {
     console.warn("[BundleNodes] describeTarget: no links on slot", { node: node.id, slotIndex });
     return null;
@@ -212,6 +214,7 @@ app.registerExtension({
       };
 
       nodeType.prototype._getDownstreamOut = function () {
+        if (!this.graph) return null; // mid-clone (subgraph conversion)
         const out = this.outputs?.[0];
         const linkId = out?.links?.[0];
         const link = linkId != null && this.graph.links[linkId];
@@ -297,6 +300,7 @@ app.registerExtension({
       };
 
       nodeType.prototype._getUpstreamIn = function () {
+        if (!this.graph) return null; // mid-clone (subgraph conversion)
         const slot = this.inputs[0];
         const link = slot && this.graph.links[slot.link];
         if (!link) return null;

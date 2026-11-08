@@ -21,7 +21,9 @@ One prompt encode that can carry, all at once:
   * first_frame / last_frame keyframes
   * native reference_images (individual, auto-expanding slots - same UI
     as the native H3 node's own `ref_images` Autogrow input)
-  * one reference video, one standalone reference audio
+  * native-style Autogrow `reference_videos` / `reference_video_audios`
+    (index-paired soundtracks) / `reference_audios`, up to 3 each - same
+    inputs and pairing as core's own MiniMaxH3ReferenceToVideo
   * a Media Loader bundle (`references`, H3_REFS)
   * a RefMod bundle (`mods`, H3_REF_MODS - shared with
     ComfyUI-MiniMaxH3Mod / the Fantastic pack's own loaders)
@@ -36,11 +38,9 @@ both together.
 
 WHAT THIS NODE DOES **NOT** COVER
 ----------------------------------
-Multiple reference videos/audios (core's native node supports up to 3 of
-each via its own Autogrow inputs; this node takes one of each - add more
-via the Media Loader bundle instead), and any of UC-Nodes' own
-visual/token/temporal fusion or clip-continuation features, which have no
-counterpart in ComfyUI core and were never re-implemented here.
+Any of UC-Nodes' own visual/token/temporal fusion or clip-continuation
+features, which have no counterpart in ComfyUI core and were never
+re-implemented here.
 """
 
 import math
@@ -295,8 +295,20 @@ class PK_MiniMaxH3Combined(io.ComfyNode):
                         input=io.Image.Input("reference_image",
                             tooltip="Reference image (downscaled to 2048 short edge if larger, never upscaled)"),
                         prefix="reference_image_", min=0, max=9)),
-                io.Image.Input("video", optional=True, tooltip="A single reference video (frame batch, 24 fps, 2-15s)."),
-                io.Audio.Input("audio", optional=True, tooltip="A single standalone reference audio clip."),
+                io.Autogrow.Input("reference_videos", optional=True,
+                    template=io.Autogrow.TemplatePrefix(
+                        input=io.Image.Input("reference_video",
+                            tooltip="Reference video frames at 24 fps (2-15s)"),
+                        prefix="reference_video_", min=0, max=3)),
+                io.Autogrow.Input("reference_video_audios", optional=True,
+                    template=io.Autogrow.TemplatePrefix(
+                        input=io.Audio.Input("reference_video_audio",
+                            tooltip="Soundtrack of the same-numbered reference video"),
+                        prefix="reference_video_audio_", min=0, max=3)),
+                io.Autogrow.Input("reference_audios", optional=True,
+                    template=io.Autogrow.TemplatePrefix(
+                        input=io.Audio.Input("reference_audio", tooltip="Standalone reference audio"),
+                        prefix="reference_audio_", min=0, max=3)),
                 io.Combo.Input("ref_image_size", options=["match", "max", "none"], default="match",
                     tooltip="'match' scales each reference (down only, keeping aspect) to the generation's "
                             "pixel area. 'max' uses the reference pipeline's 2048px short edge for best "
@@ -309,11 +321,11 @@ class PK_MiniMaxH3Combined(io.ComfyNode):
                             "images), independent of the resolution actually VAE-encoded as the DiT reference. "
                             "0 (or out of 256-4096) keeps the same resolution as the DiT reference."),
                 io.Int.Input("vlm_video_resolution", default=384, min=0, max=4096, step=32,
-                    tooltip="Qwen3-VL presentation resolution for the reference `video` input's sampled frames. "
+                    tooltip="Qwen3-VL presentation resolution for the `reference_videos` inputs' sampled frames. "
                             "Higher values use more visual tokens. 0 (or out of 256-4096) keeps original size."),
                 io.Custom("H3_REFS").Input("references", optional=True,
                     tooltip="Media Loader bundle (pictures/videos/video_audios/audios). "
-                            "Labelled after first_frame/last_frame/reference_images/video/audio, before RefMods."),
+                            "Labelled after first_frame/last_frame/reference_images/reference_videos/reference_audios, before RefMods."),
                 io.Custom("H3_REF_MODS").Input("mods", optional=True,
                     tooltip="RefMod bundle from a RefMod Stack, or a Prompt Builder's 'mods' output. Labelled last."),
                 io.Float.Input("reference_fps", default=24.0, min=1.0, max=120.0,
@@ -331,7 +343,8 @@ class PK_MiniMaxH3Combined(io.ComfyNode):
     @classmethod
     def execute(cls, clip, prompt, width=1344, height=768, length=124,
                 vae=None, audio_vae=None, first_frame=None, last_frame=None,
-                reference_images=None, video=None, audio=None,
+                reference_images=None,
+                reference_videos=None, reference_video_audios=None, reference_audios=None,
                 ref_image_size="match", vlm_resolution=384, vlm_video_resolution=384,
                 references=None, mods=None,
                 reference_fps=24.0, max_total_tokens=0) -> io.NodeOutput:
@@ -391,41 +404,59 @@ class PK_MiniMaxH3Combined(io.ComfyNode):
                 z = vae.encode(resized)
                 ref_blocks.append({"kind": "image", "latent_h": th // 16, "latent_w": tw // 16, "latent": z})
 
-        # ---- reference video (single) ----
-        if video is not None:
-            vh, vw = video.shape[1], video.shape[2]
-            cw, ch = core.adapt_canvas(vw, vh)
-            if vw * vh < cw * ch:
-                cw = max(core.CANVAS_MULTIPLE, round(vw / core.CANVAS_MULTIPLE) * core.CANVAS_MULTIPLE)
-                ch = max(core.CANVAS_MULTIPLE, round(vh / core.CANVAS_MULTIPLE) * core.CANVAS_MULTIPLE)
-            frames = core._resize(video, cw, ch, "disabled")
-            if frames.shape[0] > frame_count:
-                frames = frames[:frame_count]
-            n = frames.shape[0]
-            if n < 5:
-                raise ValueError("Reference video needs at least 5 frames (~0.2s at 24 fps).")
-            while n % 17 != 5:
-                n -= 1
-            frames = frames[:n]
+        # ---- native-style reference videos (Autogrow `reference_videos`) ----
+        # Mirrors core's MiniMaxH3ReferenceToVideo ref_videos/ref_video_audios:
+        # reference_video_audio_N is the index-paired soundtrack of
+        # reference_video_N, labelled <Audio j> right before its <Video k>.
+        reference_video_audios = reference_video_audios or {}
+        for v_idx, (v_slot, v_frames) in enumerate((reference_videos or {}).items(), 1):
+            if v_frames is None:
+                continue
+            v_soundtrack = reference_video_audios.get("reference_video_audio_" + v_slot.rsplit("_", 1)[-1])
+            v_h, v_w = v_frames.shape[1], v_frames.shape[2]
+            v_cw, v_ch = core.adapt_canvas(v_w, v_h)
+            if v_w * v_h < v_cw * v_ch:
+                v_cw = max(core.CANVAS_MULTIPLE, round(v_w / core.CANVAS_MULTIPLE) * core.CANVAS_MULTIPLE)
+                v_ch = max(core.CANVAS_MULTIPLE, round(v_h / core.CANVAS_MULTIPLE) * core.CANVAS_MULTIPLE)
+            v_resized = core._resize(v_frames, v_cw, v_ch, "disabled")
+            if v_resized.shape[0] > frame_count:
+                v_resized = v_resized[:frame_count]
+            v_n = v_resized.shape[0]
+            if v_n < 5:
+                raise ValueError(f"Reference video {v_idx} needs at least 5 frames (~0.2s at 24 fps).")
+            while v_n % 17 != 5:
+                v_n -= 1
+            v_resized = v_resized[:v_n]
+            if v_soundtrack is not None:
+                counters["audio"] += 1
+                mapping.append(f"<Audio {counters['audio']}> = soundtrack of reference video {v_idx}")
+                ref_items.append({"type": "audio"})
             counters["video"] += 1
-            mapping.append(f"<Video {counters['video']}> = video")
-            sample_idx = list(range(0, frames.shape[0], core.FPS // 2))
+            mapping.append(f"<Video {counters['video']}> = reference video {v_idx}")
+            v_sample_idx = list(range(0, v_resized.shape[0], core.FPS // 2))
             ref_items.append({"type": "video",
-                               "data": prepare_minimax_h3_vlm_video_frames(frames[sample_idx], vlm_video_resolution),
-                               "timestamps": [i / 2.0 for i in range(len(sample_idx))]})
-            if vae is not None and encode_refs:
-                z = vae.encode(frames)
-                ref_blocks.append({"kind": "video", "latent_t": z.shape[2], "latent_h": ch // 16,
-                                    "latent_w": cw // 16, "ref_audio_t": 0, "latent": z, "audio_latent": None})
+                               "data": prepare_minimax_h3_vlm_video_frames(v_resized[v_sample_idx], vlm_video_resolution),
+                               "timestamps": [i / 2.0 for i in range(len(v_sample_idx))]})
+            if vae is None or not encode_refs:
+                continue
+            v_z = vae.encode(v_resized)
+            v_audio_latent, v_ref_audio_t = None, 0
+            if v_soundtrack is not None and audio_vae is not None:
+                v_audio_latent, v_ref_audio_t = core._encode_ref_audio(audio_vae, v_soundtrack)
+            ref_blocks.append({"kind": "video_audio" if v_ref_audio_t else "video",
+                                "latent_t": v_z.shape[2], "latent_h": v_ch // 16, "latent_w": v_cw // 16,
+                                "ref_audio_t": v_ref_audio_t, "latent": v_z, "audio_latent": v_audio_latent})
 
-        # ---- standalone reference audio (single) ----
-        if audio is not None:
+        # ---- native-style standalone reference audios (Autogrow `reference_audios`) ----
+        for a_idx, a_clip in enumerate((reference_audios or {}).values(), 1):
+            if a_clip is None:
+                continue
             counters["audio"] += 1
-            mapping.append(f"<Audio {counters['audio']}> = audio")
+            mapping.append(f"<Audio {counters['audio']}> = reference audio {a_idx}")
             ref_items.append({"type": "audio"})
             if audio_vae is not None:
-                audio_latent, ref_audio_t = core._encode_ref_audio(audio_vae, audio)
-                ref_blocks.append({"kind": "audio", "ref_audio_t": ref_audio_t, "audio_latent": audio_latent})
+                a_latent, a_ref_t = core._encode_ref_audio(audio_vae, a_clip)
+                ref_blocks.append({"kind": "audio", "ref_audio_t": a_ref_t, "audio_latent": a_latent})
 
         # ---- Media Loader bundle ----
         if references is not None:

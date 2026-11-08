@@ -17,8 +17,15 @@ EXTENSION_PACKAGES = [
     "ComfyUI-H3-AdaLN-LoRA-Fix",
     "ComfyUI-H3-MiniMax-Cache",
     "ComfyUI-H3-SLA-Attention",
-    "ComfyUI-H3-UltimateUpscale-LD",
+    "ComfyUI-H3-Video-Upsampler",
+
 ]
+
+# Per-package node-menu category overrides: applied to every node class the
+# package registers (V1 or V3) after merge.
+PACKAGE_CATEGORIES = {
+    "ComfyUI-H3-Video-Upsampler": "PlagueKind/minimax/upscaler",
+}
 
 
 def _run_async(coro):
@@ -45,17 +52,32 @@ def _load_extension_package(pkg_dir_name):
         sys.modules[module_name] = module
         spec.loader.exec_module(module)
 
+        registered = []
         entrypoint = getattr(module, "comfy_entrypoint", None)
-        if entrypoint is None:
+        if entrypoint is not None:
+            extension = _run_async(entrypoint())
+            node_classes = _run_async(extension.get_node_list())
+            for cls in node_classes:
+                schema = cls.define_schema()
+                NODE_CLASS_MAPPINGS[schema.node_id] = cls
+                NODE_DISPLAY_NAME_MAPPINGS[schema.node_id] = (
+                    schema.display_name or schema.node_id)
+                registered.append(cls)
+        elif getattr(module, "NODE_CLASS_MAPPINGS", None):
+            # V1-style sub-package (plain mappings, no comfy_entrypoint) -
+            # merge it directly.
+            NODE_CLASS_MAPPINGS.update(module.NODE_CLASS_MAPPINGS)
+            if getattr(module, "NODE_DISPLAY_NAME_MAPPINGS", None):
+                NODE_DISPLAY_NAME_MAPPINGS.update(
+                    module.NODE_DISPLAY_NAME_MAPPINGS)
+            registered = list(module.NODE_CLASS_MAPPINGS.values())
+        else:
             return  # package logged its own failure and disabled itself
 
-        extension = _run_async(entrypoint())
-        node_classes = _run_async(extension.get_node_list())
-        for cls in node_classes:
-            schema = cls.define_schema()
-            NODE_CLASS_MAPPINGS[schema.node_id] = cls
-            NODE_DISPLAY_NAME_MAPPINGS[schema.node_id] = (
-                schema.display_name or schema.node_id)
+        category = PACKAGE_CATEGORIES.get(pkg_dir_name)
+        if category:
+            for cls in registered:
+                cls.CATEGORY = category
     except Exception as e:
         print(f"[PlagueKind-Nodes] Failed to load extension package {pkg_dir_name}: {e}")
 
