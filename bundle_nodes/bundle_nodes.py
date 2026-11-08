@@ -37,9 +37,11 @@ class PlagueKindBundleOut:
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {"bundle": ("BUNDLE", {})}}
+        return {"required": {}, "optional": {"bundle": ("BUNDLE", {})}}
 
-    def execute(self, bundle):
+    def execute(self, bundle=None):
+        if bundle is None:
+            return tuple(None for _ in range(MAX_SLOTS))
         return tuple(bundle.get(f"input_{i + 1}") for i in range(MAX_SLOTS))
 
 

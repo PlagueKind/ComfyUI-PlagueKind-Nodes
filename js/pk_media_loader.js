@@ -8,7 +8,9 @@ import { app } from "../../scripts/app.js";
 //   - a tab bar across the top (I1..I9, V1..V3, ALL) — 13 tabs
 //   - only the active slot's combo + upload button + preview are shown
 //     (video tabs also show their audio toggle)
-//   - image slots preview the selected file; video slots get a <video> player
+//   - each slot previews its selected file in a DOM widget (<img> or a
+//     <video> player); the frontend's canvas/media pipeline is disowned in
+//     tab mode so nothing fights over the preview area
 //   - ALL restores the normal view with every slot + toggle
 //
 // Tab state lives in node.flags (persisted with the workflow, never sent in
@@ -61,17 +63,36 @@ function removeWidget(node, name) {
 	return true;
 }
 
+// Stable per-file URL for this session. The rand param busts the browser's
+// HTTP cache, so a fresh URL on every call would re-download the file on
+// every tab switch — the main source of preview lag. One URL per file keeps
+// the browser cache warm; re-uploads invalidate their entry (bustFileUrl).
+const fileUrlCache = new Map();
 function slotFileUrl(file) {
-	// this frontend serves media through the API view endpoint
-	return (
-		"/api/view?type=input&filename=" + encodeURIComponent(file) +
-		"&subfolder=&rand=" + Math.random()
-	);
+	let url = fileUrlCache.get(file);
+	if (!url) {
+		url =
+			"/api/view?type=input&filename=" + encodeURIComponent(file) +
+			"&subfolder=&rand=" + Math.random().toString(36).slice(2, 10);
+		fileUrlCache.set(file, url);
+	}
+	return url;
+}
+
+function bustFileUrl(file) {
+	fileUrlCache.delete(file);
 }
 
 function dirty(node) {
 	node.setDirtyCanvas?.(true, true);
 	node.graph?.setDirtyCanvas?.(true, true);
+	// force an immediate canvas draw + graph version bump: the Vue DOM-widget
+	// overlay re-attaches on a real draw, so this keeps the preview from
+	// waiting for the next idle redraw (the "sometimes not shown" gap)
+	try {
+		if (node.graph) node.graph._version++;
+	} catch (e) { /* graph not attached yet */ }
+	app.canvas?.draw?.(true);
 }
 
 /**
@@ -101,23 +122,74 @@ function fitNode(node) {
 }
 
 /**
- * Preview strategy:
- *  - image tabs: node.imgs = [the active slot's image] — the frontend's own
- *    canvas preview renders a single image (one entry = no thumbnail strip).
- *    We cooperate with it instead of fighting it.
- *  - video tabs: node.imgs cleared + a DOM <video> widget (the canvas system
- *    can't play mp4s).
+ * Preview strategy (tightened):
+ *  - ALL slots (image and video) render through our own DOM preview widget
+ *    (one <img>/<video> inside $$pk_media_preview) — the same code path for
+ *    both. The frontend's canvas/media pipeline is disowned in tab mode
+ *    (node.imgs cleared, its canvas preview widget removed by the guard),
+ *    so nothing fights us over the preview area or clobbers it mid-load.
+ *  - image: progressive DOM render as bytes arrive; onerror → a
+ *    "file not found" hint (a deleted input file no longer leaves a blank).
+ *  - video: <video> player with preload="metadata".
  */
-function getImageEl(node, file) {
-	if (!node.__pkImgCache) node.__pkImgCache = new Map();
-	let img = node.__pkImgCache.get(file);
-	if (!img) {
-		img = new Image();
-		img.src = slotFileUrl(file);
-		img.alt = file;
-		node.__pkImgCache.set(file, img);
-	}
-	return img;
+function showImageWidget(node, slot, file) {
+	const existing = findWidget(node, PREVIEW_NAME);
+	if (existing && existing.__pkFile === file) return; // already showing it
+	if (existing) removeWidget(node, PREVIEW_NAME);
+
+	const div = document.createElement("div");
+	div.style.cssText =
+		"display:flex;justify-content:center;align-items:center;padding:4px 0 2px 0;overflow:hidden;";
+	const img = new Image();
+	img.alt = file;
+	img.style.cssText =
+		"max-width:100%;max-height:100%;border-radius:4px;background:#000;display:block;";
+
+	// track the image's real aspect ratio so the widget's layout height
+	// matches the rendered picture (mirrors the video widget below);
+	// re-run from the guard tick so manual resizes re-fit it
+	let h = 120;
+	const applyDims = () => {
+		const iw = img.naturalWidth, ih = img.naturalHeight;
+		if (iw && ih) {
+			const maxW = Math.max(200, (node.size?.[0] ?? 330) - 20);
+			const capH = Math.max(160, (node.size?.[1] ?? 240) - 150);
+			h = Math.min(capH, Math.max(80, Math.round((maxW * ih) / iw)));
+		}
+		if (div.style.height === h + "px") return; // no change — no redraw
+		div.style.height = h + "px";
+		const wgt = findWidget(node, PREVIEW_NAME);
+		if (wgt) wgt.__pkH = h;
+		dirty(node);
+	};
+	img.onload = () => {
+		applyDims();
+		fitNode(node); // grow to fit once the real aspect ratio is known
+	};
+	img.onerror = () => {
+		// file was deleted from the input folder — say so instead of blank
+		div.textContent = "file not found: " + file;
+		div.style.color = "#e07b7b";
+		div.style.fontSize = "11px";
+		const wgt = findWidget(node, PREVIEW_NAME);
+		if (wgt) wgt.__pkH = 28;
+		dirty(node);
+	};
+	img.src = slotFileUrl(file);
+
+	div.appendChild(img);
+	const w = node.addDOMWidget(PREVIEW_NAME, "string", div, {
+		serialize: false,
+		surfaces: { canvas: "shown", vueNode: "never", panel: "never" },
+	});
+	w.__pkFile = file;
+	w.__pkH = h;
+	w.__pkApplyDims = applyDims; // guard tick re-fits after manual resizes
+	w.computeLayoutSize = () => ({
+		minHeight: w.__pkH ?? 120,
+		minWidth: 220, // picture width follows the node (div is 100%)
+	});
+	fitNode(node);
 }
 
 function showVideoWidget(node, slot, file) {
@@ -182,35 +254,18 @@ function syncPreview(node, slot) {
 	const combo = findWidget(node, slot);
 	const value = combo?.value;
 
-	if (isVideoSlot(slot)) {
-		// video: DOM player, canvas preview must stay empty
-		if (node.imgs) {
-			node.imgs = undefined;
-			node.imageIndex = null;
-		}
-		if (value && value !== NONE) {
-			showVideoWidget(node, slot, value);
-		} else if (findWidget(node, PREVIEW_NAME)) {
-			removeWidget(node, PREVIEW_NAME);
-		}
-		return;
+	// we own the preview area in tab mode — keep the canvas/media pipeline out
+	if (node.imgs) {
+		node.imgs = undefined;
+		node.imageIndex = null;
 	}
 
-	// image slot: drop any DOM video widget, drive the canvas preview
-	if (findWidget(node, PREVIEW_NAME)) removeWidget(node, PREVIEW_NAME);
 	if (!value || value === NONE) {
-		if (node.imgs) {
-			node.imgs = undefined;
-			node.imageIndex = null;
-		}
+		if (findWidget(node, PREVIEW_NAME)) removeWidget(node, PREVIEW_NAME);
 		return;
 	}
-	const img = getImageEl(node, value);
-	if (!node.imgs || node.imgs[0] !== img) {
-		node.imgs = [img];
-		node.imageIndex = 0;
-		dirty(node);
-	}
+	if (isVideoSlot(slot)) showVideoWidget(node, slot, value);
+	else showImageWidget(node, slot, value);
 }
 
 /**
@@ -251,6 +306,7 @@ async function handleFilePicked(node, slot, file) {
 		const data = await resp.json();
 		const name = data?.name;
 		if (!name) throw new Error("no filename in response");
+		bustFileUrl(name); // re-upload under the same name → fresh URL
 		await refreshFileLists(node);
 		const combo = findWidget(node, slot);
 		if (combo) {
@@ -406,16 +462,15 @@ function buildTabBar(node) {
 function guardPreview(node) {
 	const slot = node.flags?.[TAB_FLAG];
 	if (!slot || slot === ALL) return;
-	syncPreview(node, slot);
-	// video mode: keep the canvas preview widget away (it can't play mp4s)
-	// and re-fit the player to the node's current (possibly pinned) size
-	if (isVideoSlot(slot)) {
-		if (findWidget(node, CANVAS_PREVIEW_NAME)) {
-			removeWidget(node, CANVAS_PREVIEW_NAME);
-			dirty(node);
-		}
-		findWidget(node, PREVIEW_NAME)?.__pkApplyDims?.();
+	// in tab mode we own the preview area: keep the frontend's canvas
+	// pipeline (its canvas preview widget) out of it, then re-assert our DOM
+	// preview and re-fit it to the node's current (possibly pinned) size
+	if (findWidget(node, CANVAS_PREVIEW_NAME)) {
+		removeWidget(node, CANVAS_PREVIEW_NAME);
+		dirty(node);
 	}
+	syncPreview(node, slot);
+	findWidget(node, PREVIEW_NAME)?.__pkApplyDims?.();
 }
 
 // Continuous guard: the media pipeline writes node.imgs asynchronously and
