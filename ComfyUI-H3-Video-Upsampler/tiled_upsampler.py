@@ -632,8 +632,40 @@ def cond_for_tile(cond, h, w, r0, c0, rows, cols):
                     kf["latent"] = lt[:, :, :, r0:r0 + rows, c0:c0 + cols].contiguous()
                 kfs.append(kf)
             d["minimax_keyframes"] = kfs
+        if any(b.get(TILE_CROP_KEY) for b in (d.get("minimax_refs") or ())):
+            d["minimax_refs"] = [_crop_ref(b, h, w, r0, c0, rows, cols)
+                                 if b.get(TILE_CROP_KEY) else b for b in d["minimax_refs"]]
         out.append([emb, d])
     return out
+
+
+# A reference block marked with this key shows the same frames as the clip
+# being re-drawn (IC's <Video 1> draft): a tile gets the matching window of it,
+# so each tile sees the draft of what it re-draws, as IC was trained.
+TILE_CROP_KEY = "htc_tile_crop"
+
+
+def _crop_ref(blk, h, w, r0, c0, rows, cols):
+    """The tile's window of a whole-frame reference video, on the reference's
+    own grid (proportional, snapped outward to even rows/cols for the 2x2
+    patch)."""
+    lt = blk.get("latent")
+    if lt is None:
+        return blk
+    rh, rw = int(lt.shape[3]), int(lt.shape[4])
+
+    def span(a, n, full, ref):
+        lo = int(math.floor(a * ref / float(full) / 2.0)) * 2
+        hi = int(math.ceil((a + n) * ref / float(full) / 2.0)) * 2
+        return max(0, lo), min(ref, max(hi, lo + 2))
+    y0, y1 = span(r0, rows, h, rh)
+    x0, x1 = span(c0, cols, w, rw)
+    if (y0, y1, x0, x1) == (0, rh, 0, rw):
+        return blk
+    blk = dict(blk)
+    blk["latent"] = lt[:, :, :, y0:y1, x0:x1].contiguous()
+    blk["latent_h"], blk["latent_w"] = y1 - y0, x1 - x0
+    return blk
 
 
 def encode_steps(encode, frames, steps):
@@ -1836,7 +1868,7 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
              attn_chunks=4, ffn_chunks=2, sigmas=None,
              structure_lock=STRUCTURE_LOCK, lock_sigma=LOCK_SIGMA,
              attention="dense", chunk_join="crossfade", chunking=True, tiling=True,
-             lock_anchor="source", tile_context="none"):
+             lock_anchor="source", tile_context="none", ic=None):
     """The whole recipe on an H3 AV latent. -> the upsampled AV latent dict.
 
     `conditioning` is one conditioning for the whole clip, or a callable
@@ -1855,6 +1887,11 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
     its own 3D-upscaled frames (`structure_lock_fn`); 0 is the recipe as is.
     `attention`, `chunk_join`, `chunking`, `tiling` and `lock_anchor`: see
     ATTENTION_MODES and the notes above it.
+
+    `ic` (an upsample_ic.ChunkConds) makes it the in-context re-draw: before the
+    DiT is staged, each chunk's conditioning is built from that chunk's own
+    low-res draft latent, which rides as <Video 1>; `conditioning` is then
+    unused. The caller passes the IC-patched model and sigmas.
     """
     import comfy.nested_tensor as nt
 
@@ -1909,8 +1946,11 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
         sigmas = (sigmas.detach().cpu().float() if isinstance(sigmas, torch.Tensor)
                   else torch.tensor(list(sigmas), dtype=torch.float32))
         chunk_frames, _ = _regen2k_chunk_frames(w_px, h_px, budget, chunk_frames, overlap_px)
+        # IC: a short tail always folds into the chunk before it (a 124-frame
+        # clip is one 124-frame chunk, the IC training window)
         plan = regen2k_chunks(tv, int(chunk_frames), int(chunk_overlap),
-                              w_px=w_px, h_px=h_px, budget=budget, overlap_px=overlap_px)
+                              w_px=(0 if ic is not None else w_px), h_px=h_px,
+                              budget=budget, overlap_px=overlap_px)
     else:
         sigmas = recipe_sigmas(model, denoise, steps, start_sigma)
         plan = chunks(tv, int(chunk_frames), int(chunk_overlap))
@@ -1951,6 +1991,22 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
             del px, glat
         if _device().type == "cuda":
             _free_all_gpu()
+    if ic is not None and sigmas is not None:
+        # Phase 1 (IC): every chunk's text encode (Qwen3-VL sees the chunk's
+        # draft) and reference block, on CPU, before the DiT is staged, so the
+        # text encoder and the DiT never share VRAM.
+        _ti = time.perf_counter()
+        ic_conds = {}
+        for i, (k0, f0, k1, f1) in enumerate(plan):
+            ic_conds[(f0, f1)] = ic.build(raw_cvs[i])
+        if _device().type == "cuda":
+            _free_all_gpu()
+        conditioning = (lambda f0, f1, _c=ic_conds: _c[(f0, f1)])
+        per_chunk = True
+        print(f"[{TAG}] ic: {len(plan)} chunk(s) of {[p[3] - p[1] for p in plan]} frames, "
+              f"draft kept in context as <Video 1>"
+              + (f" ({ic.resized} shrunk to the reference canvas)" if ic.resized else "")
+              + f", {time.perf_counter() - _ti:.1f} s", flush=True)
 
     _tp.append(time.perf_counter())
     upscaled_cvs = upscale_film(video, plan, upscaler, w_px, h_px)
@@ -2237,7 +2293,7 @@ def match_levels(frames, ref, chunk=16, in_place=False):
 def upsample_chain(model, sampler, vae, hops, megapixels, master=None,
                    upscaler=UPSCALER_FILE, decode=None, denoise=DENOISE,
                    alloc=None, guide=None, budget=TOKEN_BUDGET, settings=None,
-                   sigmas=None):
+                   sigmas=None, out_hops=None, ic=None):
     """The recipe over a finished chain. -> (IMAGE [N,H,W,3], note).
 
     `hops` are per-hop dicts: video/audio (the hop's delivered sampler
@@ -2294,12 +2350,36 @@ def upsample_chain(model, sampler, vae, hops, megapixels, master=None,
         )
         if sigmas is not None:
             _ukw["sigmas"] = sigmas
+        if ic is not None:
+            _ukw["ic"] = ic
         out = upsample(model, cond_by_frame(seg), lat, sampler, upscaler,
                        megapixels, denoise, guide=guide, budget=_cur_budget,
                        **_ukw)
         if _cur_budget is not None and _LAST_BUDGET[0] < int(_cur_budget):
             _cur_budget = int(_LAST_BUDGET[0])
         vid = out["samples"].tensors[0]
+        if out_hops is not None:
+            _t_cur = 0
+            for _hi, _h in enumerate(seg):
+                _v_orig = _h["video"] if _h["video"].ndim == 5 else _h["video"].unsqueeze(0)
+                _a_orig = _h["audio"] if _h["audio"].ndim == 4 else _h["audio"].unsqueeze(0)
+                _drop_f = 0 if _hi == 0 else int(_h["drop"])
+                _k_drop = tokens_to_reach(_drop_f)
+                _tail_f = int(_h.get("tail") or 0)
+                _k_end = (tokens_to_reach(frames_in(int(_v_orig.shape[2])) - _tail_f)
+                          if _tail_f else int(_v_orig.shape[2]))
+                _k_len = _k_end - _k_drop
+                _a_drop = round(_drop_f * FRAME_RESCALE)
+                _a_end = int(_a_orig.shape[-1]) - round(_tail_f * FRAME_RESCALE)
+                out_hops.append({
+                    **_h,
+                    "start": (_hi == 0),
+                    "video": vid[:, :, _t_cur:_t_cur + _k_len].detach().cpu().contiguous(),
+                    "audio": _a_orig[..., _a_drop:_a_end].detach().cpu().contiguous(),
+                    "drop": 0,
+                    "tail": 0,
+                })
+                _t_cur += _k_len
         _free(model)
         if _device().type == "cuda":
             _free_all_gpu()
@@ -2466,8 +2546,9 @@ class HTCUpsampleSettings:
             "required": {
                 "steps": ("INT", {
                     "default": 3, "min": 1, "max": 8,
-                    "tooltip": "Re-draw steps. 3 = the Regen2K recipe. 2 = a third faster, "
-                               "and in side-by-side tests looked the same."}),
+                    "tooltip": "Re-draw steps. 3 = the recipe. 2 = about a third faster; for "
+                               "Regen2K it looked the same in side-by-side tests, for "
+                               "upsample_redraw ic it starts later, so less is re-drawn."}),
                 "start_sigma": ("FLOAT", {
                     "default": d["start_sigma"], "min": 0.0, "max": 1.0, "step": 0.01,
                     "tooltip": ("Leave at 0 (the Regen2K recipe; redraw_start sets how much "
@@ -2525,7 +2606,7 @@ class HTCUpsampleSettings:
                     "default": d["redraw_start"], "min": 0.3, "max": 0.95, "step": 0.05,
                     "tooltip": "How much the re-draw is allowed to change. 0.6 (default) "
                                "keeps faces close to the chain's frames; 0.8 = the original "
-                               "Regen2K recipe, sharper but faces drift more."}),
+                               "Regen2K recipe, sharper but faces drift more. Regen2K only."}),
             },
             "optional": {
                 "sampler": ("SAMPLER", {
