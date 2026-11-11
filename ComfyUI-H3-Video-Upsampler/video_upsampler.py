@@ -539,10 +539,6 @@ class HTCVideoUpsampler:
                     "default": _ic.METHODS[0], "tooltip": _ic.METHOD_TIP}),
             },
             "optional": {
-                "clip": ("CLIP", {"tooltip": (
-                    "Optional, method ic only: the H3 text encoder (CLIPLoader, type minimax), "
-                    "shown each piece of the clip. Unwired, ic uses its task prompt encoded "
-                    "once (upsample_ic_task.safetensors) and no text encoder loads.")}),
                 "conditioning": ("CONDITIONING", {"tooltip": (
                     "Optional: a text prompt (CLIPTextEncode with the H3 text encoder) "
                     "describing the clip. Describe the look (\"2D anime, flat cel shading, "
@@ -558,6 +554,11 @@ class HTCVideoUpsampler:
                 "audio_vae": ("VAE", {"tooltip": (
                     "The H3 audio VAE. Lets the re-draw hear the soundtrack, which keeps "
                     "mouths in sync. Without it the re-draw hears silence.")}),
+                # appended last: saved workflows link sockets by slot position
+                "clip": ("CLIP", {"tooltip": (
+                    "Optional, method ic only: the H3 text encoder (CLIPLoader, type minimax), "
+                    "shown each piece of the clip. Unwired, ic uses its task prompt encoded "
+                    "once (upsample_ic_task.safetensors) and no text encoder loads.")}),
             },
         }
 
