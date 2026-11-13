@@ -92,12 +92,26 @@ for root, dirs, files in os.walk(current_dir):
         continue
     if any(root == d or root.startswith(d + os.sep) for d in _extension_dirs):
         continue  # handled above as real packages
+    if "__init__.py" in files:
+        # A package that is not in EXTENSION_PACKAGES - usually a folder an
+        # older release shipped, left behind by a zip update. The per-file
+        # walker cannot load packages, and registering their files by bare
+        # name can shadow core modules (a stale nodes.py replaced ComfyUI's
+        # own `nodes`), so leave the whole subtree alone.
+        print(f"[PlagueKind-Nodes] Skipping unlisted package {os.path.relpath(root, current_dir)}")
+        dirs[:] = []
+        continue
     if root not in sys.path:
         sys.path.insert(0, root)
     for file in files:
         if file.endswith(".py") and not file.startswith("_"):
             file_path = os.path.join(root, file)
             module_name = file[:-3]
+            existing = sys.modules.get(module_name)
+            if existing is not None and not os.path.abspath(getattr(existing, "__file__", None) or "").startswith(current_dir + os.sep):
+                # Never replace a module someone else owns (nodes, server, utils...).
+                print(f"[PlagueKind-Nodes] {file}: module name '{module_name}' is taken, loading it as plaguekind_nodes_{module_name}")
+                module_name = "plaguekind_nodes_" + module_name
             try:
                 spec = importlib.util.spec_from_file_location(module_name, file_path)
                 if spec and spec.loader:
