@@ -49,7 +49,20 @@ import torch.nn.functional as F
 TAG = "H3VideoUpsampler"
 
 # --- the recipe -------------------------------------------------------------
-UPSCALER_FILE = "minimax_h3_latent_upscaler_3d_bf16.safetensors"
+UPSCALER_FILE = "minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors"
+# The same 3D weights under every name LBH-123-AI has published them: HF renamed
+# minimax_h3_latent_upscaler_3d_bf16 to ..._3d_conv_v1_bf16 on 2026-11-10, and
+# saved workflows hold either. Any of them loads whichever of them is on disk.
+UPSCALER_3D_NAMES = (UPSCALER_FILE, "minimax_h3_latent_upscaler_3d_bf16.safetensors")
+# LBH-123-AI's 2D release (2026-11-10): Conv2d per frame + shared temporal
+# blocks, 182M params, with 6 sharpness tiers the network is conditioned on.
+UPSCALER_2D_FILE = "minimax_h3_latent_upscaler_2d_conv_v1_bf16.safetensors"
+SHARPNESS = 1               # 2D tier: 1 most faithful (the 3D's look) .. 6 sharpest
+SHARPNESS_MAX = 6
+SHARPNESS_TIP = ("Sharpness tier of the 2D latent upscaler (" + UPSCALER_2D_FILE + "): "
+                 "1 = most faithful to the clip (softest, about the 3D upscaler's look), "
+                 "6 = sharpest (most new detail, furthest from the clip). The 3D upscaler "
+                 "has no tiers and ignores it.")
 MEGAPIXELS = 2.0            # 1 MP = 1024 x 1024 px, the only widget
 SIZE_ALIGN = 32             # both edges snap to this, aspect held
 CHUNK_FRAMES = 102          # pixel frames per time chunk (a multiple of 17)
@@ -166,7 +179,7 @@ LATENT_STD = (
     0.7729952931404114, 1.8955937623977661, 0.946841835975647,
     0.7996809482574463, 0.44988900423049927, 0.7197399735450745,
     0.6936293244361877, 2.961095094680786, 2.7694199085235596,
-    3.0496184825897217, 2.1088054180265264, 3.276226282119751,
+    3.0496184825897217, 2.1088054180145264, 3.276226282119751,
     3.1627357006073, 2.2816812992095947, 2.6127843856811523,
 )
 
@@ -186,9 +199,53 @@ def choices():
                  if n.endswith(".safetensors")]
     except Exception:  # noqa: BLE001
         names = []
-    if UPSCALER_FILE in names:
-        names.remove(UPSCALER_FILE)
-    return [UPSCALER_FILE] + sorted(names)
+    # Both 3D names always listed (saved workflows hold either, and ComfyUI
+    # refuses a combo value missing from the list); the installed one first.
+    first = default_upscaler(names)
+    rest = [n for n in UPSCALER_3D_NAMES if n != first]
+    return [first] + rest + sorted(n for n in names if n not in UPSCALER_3D_NAMES)
+
+
+def default_upscaler(names=None):
+    """The 3D file under the name it is installed as (the new name when neither is)."""
+    if names is None:
+        try:
+            import folder_paths
+            names = folder_paths.get_filename_list(FOLDER)
+        except Exception:  # noqa: BLE001
+            names = []
+    for n in UPSCALER_3D_NAMES:
+        if n in names:
+            return n
+    return UPSCALER_FILE
+
+
+def resolve_upscaler(name):
+    """`name`'s full path; a 3D name falls back to the other 3D names. -> (name, path)."""
+    import folder_paths
+    path = folder_paths.get_full_path(FOLDER, str(name))
+    if path:
+        return str(name), path
+    if str(name) in UPSCALER_3D_NAMES:
+        for alt in UPSCALER_3D_NAMES:
+            path = folder_paths.get_full_path(FOLDER, alt)
+            if path:
+                return alt, path
+    raise RuntimeError(f"{TAG}: {name!r} is not in models/{FOLDER}. Download "
+                       f"{UPSCALER_FILE} (3D) or {UPSCALER_2D_FILE} (2D) from "
+                       "huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler "
+                       f"into models/{FOLDER}.")
+
+
+def is_2d_file(name):
+    """True when `name` holds LBH-123-AI's 2D upscaler (read from its keys only)."""
+    try:
+        from safetensors import safe_open
+        _, path = resolve_upscaler(name)
+        with safe_open(path, framework="pt", device="cpu") as f:
+            return any(k.startswith("resizer.") for k in f.keys())
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # --- size -------------------------------------------------------------------
@@ -632,8 +689,40 @@ def cond_for_tile(cond, h, w, r0, c0, rows, cols):
                     kf["latent"] = lt[:, :, :, r0:r0 + rows, c0:c0 + cols].contiguous()
                 kfs.append(kf)
             d["minimax_keyframes"] = kfs
+        if any(b.get(TILE_CROP_KEY) for b in (d.get("minimax_refs") or ())):
+            d["minimax_refs"] = [_crop_ref(b, h, w, r0, c0, rows, cols)
+                                 if b.get(TILE_CROP_KEY) else b for b in d["minimax_refs"]]
         out.append([emb, d])
     return out
+
+
+# A reference block marked with this key shows the same frames as the clip
+# being re-drawn (IC's <Video 1> draft): a tile gets the matching window of it,
+# so each tile sees the draft of what it re-draws, as IC was trained.
+TILE_CROP_KEY = "htc_tile_crop"
+
+
+def _crop_ref(blk, h, w, r0, c0, rows, cols):
+    """The tile's window of a whole-frame reference video, on the reference's
+    own grid (proportional, snapped outward to even rows/cols for the 2x2
+    patch)."""
+    lt = blk.get("latent")
+    if lt is None:
+        return blk
+    rh, rw = int(lt.shape[3]), int(lt.shape[4])
+
+    def span(a, n, full, ref):
+        lo = int(math.floor(a * ref / float(full) / 2.0)) * 2
+        hi = int(math.ceil((a + n) * ref / float(full) / 2.0)) * 2
+        return max(0, lo), min(ref, max(hi, lo + 2))
+    y0, y1 = span(r0, rows, h, rh)
+    x0, x1 = span(c0, cols, w, rw)
+    if (y0, y1, x0, x1) == (0, rh, 0, rw):
+        return blk
+    blk = dict(blk)
+    blk["latent"] = lt[:, :, :, y0:y1, x0:x1].contiguous()
+    blk["latent_h"], blk["latent_w"] = y1 - y0, x1 - x0
+    return blk
 
 
 def encode_steps(encode, frames, steps):
@@ -752,39 +841,217 @@ class LatentUpscaler(nn.Module):
         return self.conv_out(F.silu(self.norm_out(x)))
 
 
+# --- the 2D upscaler (LBH-123-AI 2d_conv_v1, MIT), in its trained layout -----
+#
+# Every frame runs through 2D residual blocks; after every other block a
+# temporal block (one shared by all the in-blocks, one by all the out-blocks)
+# mixes neighbouring frames. Between the halves the features are resized
+# bilinearly. The scale is told per axis, and a sharpness tier (1..6) rides
+# the same embedding. Clips longer than CHUNK_2D latent frames run in pieces
+# with the blocks' whole temporal reach (24 latent frames for 2d_conv_v1) of
+# context each side, exactly as the reference node does (temporal_chunking
+# "chunked", 32 frames).
+
+CHUNK_2D = 32               # latent frames per forward (the reference node's default)
+TEMPORAL_EVERY_2D = 2
+
+
+class _Res2D(nn.Module):
+    def __init__(self, c, emb):
+        super().__init__()
+        self.in_layers = nn.Sequential(_gn(c), nn.SiLU(), nn.Conv2d(c, c, 3, padding=1))
+        self.emb_layers = nn.Sequential(nn.SiLU(), nn.Linear(emb, 2 * c))
+        self.out_norm = _gn(c)
+        self.out_layers = nn.Sequential(nn.SiLU(), nn.Dropout(0.0),
+                                        nn.Conv2d(c, c, 3, padding=1))
+
+    def forward(self, x, emb):
+        h = self.in_layers(x)
+        scale, shift = self.emb_layers(emb).to(h.dtype)[..., None, None].chunk(2, dim=1)
+        return x + self.out_layers(self.out_norm(h) * (1 + scale) + shift)
+
+
+class _Temporal2D(nn.Module):
+    """GroupNorm per frame (not over the clip), then a depthwise conv over time."""
+
+    def __init__(self, c, k):
+        super().__init__()
+        self.norm = _gn(c)
+        self.dwconv = nn.Conv3d(c, c, (k, 1, 1), padding=(k // 2, 0, 0), groups=c)
+        self.pwconv = nn.Conv3d(c, c, 1)
+
+    def forward(self, x):
+        b, c, t, h, w = x.shape
+        n = self.norm(x.transpose(1, 2).reshape(b * t, c, h, w))
+        n = n.reshape(b, t, c, h, w).transpose(1, 2)
+        return x + self.pwconv(self.dwconv(F.silu(n)))
+
+
+class _Embed2D(nn.Module):
+    """Fourier code of scale_h and scale_w (and of tier - 1) -> an MLP."""
+
+    def __init__(self, in_dim, emb, freqs):
+        super().__init__()
+        self.freqs = int(freqs)
+        self.tiers = in_dim > 4 * self.freqs
+        self.linear = nn.Sequential(nn.Linear(in_dim, emb), nn.SiLU(), nn.Linear(emb, emb))
+
+    def forward(self, scale_h, scale_w, tier):
+        dev = self.linear[0].weight.device
+        f = 2.0 ** torch.arange(self.freqs, device=dev).float()
+        parts = []
+        for v in (float(scale_h), float(scale_w)):
+            a = torch.tensor([v], device=dev, dtype=torch.float32)[:, None] * f[None]
+            parts += [torch.sin(a), torch.cos(a)]
+        if self.tiers:
+            a = (torch.tensor([float(tier)], device=dev, dtype=torch.float32) - 1.0)[:, None] * f[None]
+            parts += [torch.sin(a), torch.cos(a)]
+        return self.linear(torch.cat(parts, dim=1).to(self.linear[0].weight.dtype))
+
+
+class _Resizer2D(nn.Module):
+    def __init__(self, sd, c, emb):
+        super().__init__()
+        cin = int(sd["resizer.conv_in.weight"].shape[1])
+        e_in = int(sd["resizer.embed.linear.0.weight"].shape[1])
+        self.conv_in = nn.Conv2d(cin, c, 3, padding=1)
+        self.embed = _Embed2D(e_in, emb, 16 if e_in == 96 else e_in // 4)
+        n_in = 1 + max(int(k.split(".")[2]) for k in sd if k.startswith("resizer.in_blocks."))
+        n_out = 1 + max(int(k.split(".")[2]) for k in sd if k.startswith("resizer.out_blocks."))
+        self.in_blocks = nn.ModuleList(_Res2D(c, emb) for _ in range(n_in))
+        self.out_blocks = nn.ModuleList(_Res2D(c, emb) for _ in range(n_out))
+        self.norm_out = _gn(c)
+        self.conv_out = nn.Conv2d(c, cin, 3, padding=1)
+
+
+class LatentUpscaler2D(nn.Module):
+    IS_2D = True
+
+    def __init__(self, sd):
+        super().__init__()
+        # Only the layout 2d_conv_v1 ships is built here; the reference code's
+        # optional parts (coord channels, SE, large kernels, learned
+        # PixelShuffle, multi-scale temporal) refuse rather than load wrong.
+        extra = sorted({p for k in sd for p in (".se.", ".dw.", "post_up.", "learned_up.",
+                                                 ".branches.") if p in k})
+        cin = int(sd["resizer.conv_in.weight"].shape[1])
+        if extra or cin != int(sd["resizer.conv_out.weight"].shape[0]):
+            raise RuntimeError(f"{TAG}: this 2D upscaler file has parts this node does not "
+                               f"build ({', '.join(extra) or 'coordinate channels'}).")
+        c = int(sd["resizer.conv_in.weight"].shape[0])
+        emb = int(sd["resizer.embed.linear.0.weight"].shape[0])
+        self.resizer = _Resizer2D(sd, c, emb)
+        n_t = 1 + max(int(k.split(".")[1]) for k in sd if k.startswith("temporal_blocks."))
+        k = int(sd["temporal_blocks.0.dwconv.weight"].shape[2])
+        self.temporal_blocks = nn.ModuleList(_Temporal2D(c, k) for _ in range(n_t))
+        self.tiers = self.resizer.embed.tiers
+        # context frames each side of a piece: the temporal reach of every block
+        n_temporal = sum(1 for i in range(len(self.resizer.in_blocks))
+                         if i % TEMPORAL_EVERY_2D == 0)
+        n_temporal += sum(1 for i in range(len(self.resizer.out_blocks))
+                          if i % TEMPORAL_EVERY_2D == 0)
+        self.context = max(k // 2, 1) * max(n_temporal, 1)
+
+    def _through(self, blocks, tb, x, emb, b, t):
+        for i, blk in enumerate(blocks):
+            x = blk(x, emb)
+            if i % TEMPORAL_EVERY_2D == 0 and tb is not None:
+                v = tb(x.reshape(b, t, *x.shape[1:]).transpose(1, 2))
+                x = v.transpose(1, 2).reshape(b * t, *x.shape[1:])
+        return x
+
+    def _full(self, x, hw, tier):
+        b, c, t, h, w = x.shape
+        r = self.resizer
+        emb = r.embed(hw[0] / h, hw[1] / w, tier).expand(b * t, -1)
+        y = r.conv_in(x.transpose(1, 2).reshape(b * t, c, h, w))
+        tb = self.temporal_blocks
+        y = self._through(r.in_blocks, tb[0] if len(tb) > 0 else None, y, emb, b, t)
+        y = F.interpolate(y, size=hw, mode="bilinear")
+        y = self._through(r.out_blocks, tb[1] if len(tb) > 1 else None, y, emb, b, t)
+        y = r.conv_out(F.silu(r.norm_out(y)))
+        return y.reshape(b, t, c, *hw).transpose(1, 2)
+
+    def forward(self, x, size, scale=None, tier=SHARPNESS):
+        """x [B, 24, T, H, W] normalised -> [B, 24, T, size[1], size[2]]."""
+        t = int(x.shape[2])
+        hw = (int(size[1]), int(size[2]))
+        tier = int(tier) if self.tiers else None
+        if t <= CHUNK_2D or not len(self.temporal_blocks):
+            return self._full(x, hw, tier)
+        out = x.new_zeros((x.shape[0], x.shape[1], t) + hw)
+        for s0 in range(0, t, CHUNK_2D):
+            s1 = min(t, s0 + CHUNK_2D)
+            lo, hi = max(0, s0 - self.context), min(t, s1 + self.context)
+            out[:, :, s0:s1] = self._full(x[:, :, lo:hi].contiguous(), hw,
+                                          tier)[:, :, s0 - lo:s1 - lo]
+        return out
+
+
+def _call_net(net, x, size, scale, sharpness):
+    """One forward of either upscaler; only the 2D one takes the sharpness tier."""
+    if getattr(net, "IS_2D", False):
+        return net(x, size, scale, sharpness)
+    return net(x, size, scale)
+
+
+def clamp_sharpness(v):
+    try:
+        return max(1, min(SHARPNESS_MAX, int(v)))
+    except (TypeError, ValueError):
+        return SHARPNESS
+
+
 _NET = {}
+_TIER_NOTE = set()
+
+
+def _note_sharpness(net, name, sharpness):
+    """Say once per file which tier runs, or that this file has none."""
+    key = (str(name), int(sharpness))
+    if key in _TIER_NOTE:
+        return
+    _TIER_NOTE.add(key)
+    if getattr(net, "IS_2D", False) and getattr(net, "tiers", False):
+        print(f"[{TAG}] 2D upscaler sharpness {int(sharpness)}/{SHARPNESS_MAX} "
+              "(1 = most faithful, 6 = sharpest)", flush=True)
+    elif int(sharpness) != SHARPNESS:
+        print(f"[{TAG}] sharpness {int(sharpness)} ignored: {name} has no sharpness "
+              f"tiers (only the 2D upscaler {UPSCALER_2D_FILE} does)", flush=True)
 
 
 def load_upscaler(name):
     """The network for `name`, kept on the CPU in fp16 between chunks."""
     if name in _NET:
         return _NET[name]
-    import folder_paths
     from safetensors.torch import load_file
     if not str(name).endswith(".safetensors"):
         raise RuntimeError(f"{TAG}: {name!r}: only .safetensors files are "
                            "read (no pickle).")
-    path = folder_paths.get_full_path(FOLDER, name)
-    if not path:
-        raise RuntimeError(f"{TAG}: {name!r} is not in models/{FOLDER}. "
-                           f"The recipe's file is {UPSCALER_FILE} "
-                           "(huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler).")
+    found, path = resolve_upscaler(name)
     sd = load_file(path, device="cpu")
     if any(k.startswith("upscaler.") for k in sd):
         sd = {k[len("upscaler."):]: v for k, v in sd.items()
               if k.startswith("upscaler.")}
-    if "conv_in.weight" not in sd or "embed.0.weight" not in sd:
-        raise RuntimeError(f"{TAG}: {name!r} is not an H3 latent upscaler.")
-    if int(sd["conv_in.weight"].shape[1]) != 24:
-        raise RuntimeError(f"{TAG}: {name!r} does not take 24-channel H3 latents.")
-    net = LatentUpscaler(sd)
+    if "resizer.conv_in.weight" in sd and "resizer.embed.linear.0.weight" in sd:
+        if int(sd["resizer.conv_in.weight"].shape[1]) != 24:
+            raise RuntimeError(f"{TAG}: {name!r} does not take 24-channel H3 latents.")
+        net, kind = LatentUpscaler2D(sd), "2D"
+    else:
+        if "conv_in.weight" not in sd or "embed.0.weight" not in sd:
+            raise RuntimeError(f"{TAG}: {name!r} is not an H3 latent upscaler.")
+        if int(sd["conv_in.weight"].shape[1]) != 24:
+            raise RuntimeError(f"{TAG}: {name!r} does not take 24-channel H3 latents.")
+        net, kind = LatentUpscaler(sd), "3D"
     net.load_state_dict({k: (v.to(torch.float16) if v.dtype == torch.float8_e4m3fn
                              else v) for k, v in sd.items()}, strict=True)
     net = net.eval().requires_grad_(False).to(UPSCALER_DTYPE)
     _NET.clear()
     _NET[name] = net
-    print(f"[{TAG}] upscaler {name}: "
-          f"{sum(p.numel() for p in net.parameters()) / 1e6:.0f}M params", flush=True)
+    alias = f" (installed as {found})" if found != str(name) else ""
+    tiers = (f", {SHARPNESS_MAX} sharpness tiers" if getattr(net, "tiers", False) else "")
+    print(f"[{TAG}] upscaler {name}{alias}: {kind}, "
+          f"{sum(p.numel() for p in net.parameters()) / 1e6:.0f}M params{tiers}", flush=True)
     return net
 
 
@@ -821,8 +1088,9 @@ def _is_oom(exc):
     return "out of memory" in msg or "cuda error: out of memory" in msg or "alloc" in msg
 
 
-def upscale_chunk(video, name, w_px, h_px):
+def upscale_chunk(video, name, w_px, h_px, sharpness=SHARPNESS):
     """One chunk's video latent resized to (w_px, h_px) by the upscaler.
+    `sharpness` is the 2D upscaler's tier (the 3D one has none).
 
     The network is told the scale actually achieved (mean of the two axes),
     and runs in fp16 end to end, normalisation included, as in the recipe.
@@ -844,20 +1112,22 @@ def upscale_chunk(video, name, w_px, h_px):
     if dev.type == "cuda":
         _free_all_gpu()
     net = load_upscaler(name)
+    sharpness = clamp_sharpness(sharpness)
+    _note_sharpness(net, name, sharpness)
     try:
         net = net.to(device=dev, dtype=UPSCALER_DTYPE)
         mean = torch.tensor(LATENT_MEAN, device=dev, dtype=UPSCALER_DTYPE).view(1, -1, 1, 1, 1)
         std = torch.tensor(LATENT_STD, device=dev, dtype=UPSCALER_DTYPE).view(1, -1, 1, 1, 1)
         with torch.inference_mode():
             x = (video.to(device=dev, dtype=UPSCALER_DTYPE, copy=True) - mean) / std
-            out = net(x, (t, h_out, w_out), scale)
+            out = _call_net(net, x, (t, h_out, w_out), scale, sharpness)
             del x
             out = out * std + mean
         return out.to(device="cpu", dtype=video.dtype)
     except Exception as exc:
         if dev.type != "cuda" or not _is_oom(exc):
             raise
-        print(f"[{TAG}] CUDA VRAM tight during 3D latent upscale ({exc}); "
+        print(f"[{TAG}] CUDA VRAM tight during the latent upscale ({exc}); "
               "sharing load with CPU...", flush=True)
         try:
             net.to("cpu")
@@ -870,7 +1140,7 @@ def upscale_chunk(video, name, w_px, h_px):
         std = torch.tensor(LATENT_STD, device=cpu_dev, dtype=torch.float32).view(1, -1, 1, 1, 1)
         with torch.inference_mode():
             x = (video.to(device=cpu_dev, dtype=torch.float32, copy=True) - mean) / std
-            out = net(x, (t, h_out, w_out), scale)
+            out = _call_net(net, x, (t, h_out, w_out), scale, sharpness)
             del x
             out = out * std + mean
         net.to(dtype=UPSCALER_DTYPE)
@@ -881,10 +1151,10 @@ def upscale_chunk(video, name, w_px, h_px):
             torch.cuda.empty_cache()
 
 
-def upscale_chunks_batch(videos, name, w_px, h_px):
+def upscale_chunks_batch(videos, name, w_px, h_px, sharpness=SHARPNESS):
     """Upscale a list of chunk video latents `[cv_0, cv_1, ...]` in one pass so
-    the 345M-parameter 3D Conv upscaler is loaded onto GPU once instead of 21
-    times across a 10-hop chain."""
+    the upscaler (3D 345M or 2D 182M params) is loaded onto GPU once instead of
+    21 times across a 10-hop chain."""
     if not videos:
         return []
     _, _, _t0, h_in, w_in = videos[0].shape
@@ -904,6 +1174,8 @@ def upscale_chunks_batch(videos, name, w_px, h_px):
     if dev.type == "cuda":
         _free_all_gpu()
     net = load_upscaler(name)
+    sharpness = clamp_sharpness(sharpness)
+    _note_sharpness(net, name, sharpness)
     out_list = []
     cpu = torch.device("cpu")
 
@@ -912,7 +1184,7 @@ def upscale_chunks_batch(videos, name, w_px, h_px):
         std = torch.tensor(LATENT_STD, device=d, dtype=dtype).view(1, -1, 1, 1, 1)
         with torch.inference_mode():
             x = (v.to(device=d, dtype=dtype, copy=True) - mean) / std
-            o = net(x, (int(v.shape[2]), h_out, w_out), scale)
+            o = _call_net(net, x, (int(v.shape[2]), h_out, w_out), scale, sharpness)
             del x
             return (o * std + mean).to(device="cpu", dtype=v.dtype)
 
@@ -939,7 +1211,7 @@ def upscale_chunks_batch(videos, name, w_px, h_px):
             except Exception as exc:
                 if not _is_oom(exc):
                     raise
-                print(f"[{TAG}] CUDA VRAM tight during 3D latent upscale of chunk {i + 1}/"
+                print(f"[{TAG}] CUDA VRAM tight during the latent upscale of chunk {i + 1}/"
                       f"{len(videos)} ({exc}); this chunk on the CPU, the next one back on "
                       "the GPU", flush=True)
                 net = net.to(device=cpu, dtype=torch.float32)
@@ -1000,13 +1272,17 @@ def _core_run(patcher, video, size):
     return out.to(device="cpu", dtype=video.dtype)
 
 
-def upscale_film(video, plan, name, w_px, h_px):
+def upscale_film(video, plan, name, w_px, h_px, sharpness=SHARPNESS):
     """Every chunk of `plan` upscaled, as `upscale_chunks_batch` returns them.
 
     Through core when it can: the whole film in one pass when that fits the
     device, otherwise chunk by chunk with core's faster kernels. Anything else
     (no core, a monkeypatched `upscale_chunk`, out of memory) is the bundled
     network chunk by chunk.
+
+    The 2D upscaler (core has none) runs the whole film in one call -- its own
+    32-frame pieces with 24 frames of context keep memory flat -- and every
+    chunk is cut from it, so no chunk edge cuts its temporal blocks short.
     """
     raw = [video[:, :, k0:k1].contiguous() for (k0, _f0, k1, _f1) in plan]
     if upscale_chunk is not _DEFAULT_UPSCALE_CHUNK or not raw:
@@ -1016,6 +1292,17 @@ def upscale_film(video, plan, name, w_px, h_px):
     w_out = max(1, int(round(w_px / SPATIAL)))
     if (h_out, w_out) == (h_in, w_in) or h_out < h_in or w_out < w_in:
         return upscale_chunks_batch(raw, name, w_px, h_px)  # its no-op / its refusal
+    if is_2d_file(name):
+        film = upscale_chunks_batch([video], name, w_px, h_px, sharpness)[0]
+        out = [film[:, :, k0:k1].contiguous() for (k0, _f0, k1, _f1) in plan]
+        del film
+        print(f"[{TAG}] 2D upscale: the whole film in one call ({int(tv)} latent frames), "
+              f"{len(plan)} chunk(s) cut from it", flush=True)
+        return out
+    try:
+        name = resolve_upscaler(name)[0]   # core loads by the installed name
+    except RuntimeError:
+        pass                               # load_upscaler says what is missing
     dev = _device()
     if dev.type == "cuda":
         _free_all_gpu()
@@ -1198,6 +1485,36 @@ def record_budget(key, used, final, samples):
                                           f"{oom_at})" if oom_at else ""))
 
 
+def _block_forward_takes_attention(model):
+    """Whether this model's patched H3 block forwards accept core's `attention`.
+
+    Core calls every replaced ("double_block") block with attention=... ,
+    sparse attention's producer or None. ComfyUI-KJNodes before its
+    2026-09-06 fix patches DiTBlock.forward without that argument, and the
+    run ends in the first block with "minimax_block_lowmem_forward() got an
+    unexpected keyword argument 'attention'". -> False when this model's
+    block patches would raise that.
+    """
+    import inspect
+    try:
+        from comfy.ldm.minimax.model import DiTBlock
+        if "attention" not in inspect.signature(DiTBlock.forward).parameters:
+            return True         # this core never passes it: nothing to clash with
+    except Exception:  # noqa: BLE001 -- no core module to compare against
+        return True
+    for name, obj in (getattr(model, "object_patches", None) or {}).items():
+        parts = str(name).split(".")
+        if (len(parts) < 4 or parts[-1] != "forward" or parts[-3] != "blocks"
+                or not parts[-2].isdigit()):
+            continue
+        try:
+            if "attention" not in inspect.signature(obj).parameters:
+                return False
+        except (TypeError, ValueError):
+            continue
+    return True
+
+
 def apply_sparse_attention(model):
     """ComfyUI's Model Sparse Attention (sol-attn, its defaults) on every step
     of the re-draw. -> (model, note). Kijai's low-VRAM attention composes with
@@ -1207,6 +1524,9 @@ def apply_sparse_attention(model):
                                                          parse_block_list)
     except Exception as exc:  # noqa: BLE001
         return model, f"dense (this ComfyUI has no sparse attention: {exc.__class__.__name__})"
+    if not _block_forward_takes_attention(model):
+        return model, ("dense (ComfyUI-KJNodes is too old for sparse attention: "
+                       "update it)")
     try:
         m = apply_block_sparse_attention(
             model, tau=1.3, topk_ratio=0.0, vsa=False, start_percent=0.0, end_percent=1.0,
@@ -1836,8 +2156,10 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
              attn_chunks=4, ffn_chunks=2, sigmas=None,
              structure_lock=STRUCTURE_LOCK, lock_sigma=LOCK_SIGMA,
              attention="dense", chunk_join="crossfade", chunking=True, tiling=True,
-             lock_anchor="source", tile_context="none"):
+             lock_anchor="source", tile_context="none", ic=None, sharpness=SHARPNESS):
     """The whole recipe on an H3 AV latent. -> the upsampled AV latent dict.
+
+    `sharpness` (1..6) is the 2D latent upscaler's tier; the 3D one ignores it.
 
     `conditioning` is one conditioning for the whole clip, or a callable
     `(f0, f1) -> conditioning` giving each chunk its own -- the chain passes
@@ -1855,6 +2177,11 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
     its own 3D-upscaled frames (`structure_lock_fn`); 0 is the recipe as is.
     `attention`, `chunk_join`, `chunking`, `tiling` and `lock_anchor`: see
     ATTENTION_MODES and the notes above it.
+
+    `ic` (an upsample_ic.ChunkConds) makes it the in-context re-draw: before the
+    DiT is staged, each chunk's conditioning is built from that chunk's own
+    low-res draft latent, which rides as <Video 1>; `conditioning` is then
+    unused. The caller passes the IC-patched model and sigmas.
     """
     import comfy.nested_tensor as nt
 
@@ -1909,8 +2236,11 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
         sigmas = (sigmas.detach().cpu().float() if isinstance(sigmas, torch.Tensor)
                   else torch.tensor(list(sigmas), dtype=torch.float32))
         chunk_frames, _ = _regen2k_chunk_frames(w_px, h_px, budget, chunk_frames, overlap_px)
+        # IC: a short tail always folds into the chunk before it (a 124-frame
+        # clip is one 124-frame chunk, the IC training window)
         plan = regen2k_chunks(tv, int(chunk_frames), int(chunk_overlap),
-                              w_px=w_px, h_px=h_px, budget=budget, overlap_px=overlap_px)
+                              w_px=(0 if ic is not None else w_px), h_px=h_px,
+                              budget=budget, overlap_px=overlap_px)
     else:
         sigmas = recipe_sigmas(model, denoise, steps, start_sigma)
         plan = chunks(tv, int(chunk_frames), int(chunk_overlap))
@@ -1951,9 +2281,25 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
             del px, glat
         if _device().type == "cuda":
             _free_all_gpu()
+    if ic is not None and sigmas is not None:
+        # Phase 1 (IC): every chunk's text encode (Qwen3-VL sees the chunk's
+        # draft) and reference block, on CPU, before the DiT is staged, so the
+        # text encoder and the DiT never share VRAM.
+        _ti = time.perf_counter()
+        ic_conds = {}
+        for i, (k0, f0, k1, f1) in enumerate(plan):
+            ic_conds[(f0, f1)] = ic.build(raw_cvs[i])
+        if _device().type == "cuda":
+            _free_all_gpu()
+        conditioning = (lambda f0, f1, _c=ic_conds: _c[(f0, f1)])
+        per_chunk = True
+        print(f"[{TAG}] ic: {len(plan)} chunk(s) of {[p[3] - p[1] for p in plan]} frames, "
+              f"draft kept in context as <Video 1>"
+              + (f" ({ic.resized} shrunk to the reference canvas)" if ic.resized else "")
+              + f", {time.perf_counter() - _ti:.1f} s", flush=True)
 
     _tp.append(time.perf_counter())
-    upscaled_cvs = upscale_film(video, plan, upscaler, w_px, h_px)
+    upscaled_cvs = upscale_film(video, plan, upscaler, w_px, h_px, sharpness)
     anchors = [None] * len(plan)
     if (sigmas is not None and float(structure_lock) > 0.0
             and str(lock_anchor) == "source"):
@@ -2118,7 +2464,7 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
                + out_a.numel() * out_a.element_size()) / 1048576.0
     _free(model)
     _tp.append(time.perf_counter())
-    print(f"[{TAG}] timing: guide prep {_tp[1] - _tp[0]:.1f} s, 3D upscale "
+    print(f"[{TAG}] timing: guide prep {_tp[1] - _tp[0]:.1f} s, " + ("2D" if is_2d_file(upscaler) else "3D") + " upscale "
           f"{_tp[2] - _tp[1]:.1f} s, re-draw {_redraw_s:.1f} s, join {_join_s:.1f} s "
           f"({len(plan)} chunk(s), OOM retries {_oom_total}, "
           f"joined latent {_lat_mb:.1f} MB"
@@ -2237,7 +2583,7 @@ def match_levels(frames, ref, chunk=16, in_place=False):
 def upsample_chain(model, sampler, vae, hops, megapixels, master=None,
                    upscaler=UPSCALER_FILE, decode=None, denoise=DENOISE,
                    alloc=None, guide=None, budget=TOKEN_BUDGET, settings=None,
-                   sigmas=None):
+                   sigmas=None, out_hops=None, ic=None):
     """The recipe over a finished chain. -> (IMAGE [N,H,W,3], note).
 
     `hops` are per-hop dicts: video/audio (the hop's delivered sampler
@@ -2290,16 +2636,40 @@ def upsample_chain(model, sampler, vae, hops, megapixels, master=None,
             structure_lock=st["structure_lock"], lock_sigma=st["lock_sigma"],
             attention=st["attention"], chunk_join=st["chunk_join"],
             chunking=st["chunking"], tiling=st["tiling"], lock_anchor=st["lock_anchor"],
-            tile_context=st["tile_context"],
+            tile_context=st["tile_context"], sharpness=st["sharpness"],
         )
         if sigmas is not None:
             _ukw["sigmas"] = sigmas
+        if ic is not None:
+            _ukw["ic"] = ic
         out = upsample(model, cond_by_frame(seg), lat, sampler, upscaler,
                        megapixels, denoise, guide=guide, budget=_cur_budget,
                        **_ukw)
         if _cur_budget is not None and _LAST_BUDGET[0] < int(_cur_budget):
             _cur_budget = int(_LAST_BUDGET[0])
         vid = out["samples"].tensors[0]
+        if out_hops is not None:
+            _t_cur = 0
+            for _hi, _h in enumerate(seg):
+                _v_orig = _h["video"] if _h["video"].ndim == 5 else _h["video"].unsqueeze(0)
+                _a_orig = _h["audio"] if _h["audio"].ndim == 4 else _h["audio"].unsqueeze(0)
+                _drop_f = 0 if _hi == 0 else int(_h["drop"])
+                _k_drop = tokens_to_reach(_drop_f)
+                _tail_f = int(_h.get("tail") or 0)
+                _k_end = (tokens_to_reach(frames_in(int(_v_orig.shape[2])) - _tail_f)
+                          if _tail_f else int(_v_orig.shape[2]))
+                _k_len = _k_end - _k_drop
+                _a_drop = round(_drop_f * FRAME_RESCALE)
+                _a_end = int(_a_orig.shape[-1]) - round(_tail_f * FRAME_RESCALE)
+                out_hops.append({
+                    **_h,
+                    "start": (_hi == 0),
+                    "video": vid[:, :, _t_cur:_t_cur + _k_len].detach().cpu().contiguous(),
+                    "audio": _a_orig[..., _a_drop:_a_end].detach().cpu().contiguous(),
+                    "drop": 0,
+                    "tail": 0,
+                })
+                _t_cur += _k_len
         _free(model)
         if _device().type == "cuda":
             _free_all_gpu()
@@ -2379,11 +2749,16 @@ class HTCTiledUpsampler:
                 "audio_vae": ("VAE", {"tooltip": "The H3 audio VAE."}),
                 "upscale_model": (choices(), {
                     "tooltip": "From models/latent_upscale_models. The recipe uses "
-                               f"{UPSCALER_FILE}."}),
+                               f"{UPSCALER_FILE} (3D); {UPSCALER_2D_FILE} (2D) also "
+                               "loads and takes sharpness."}),
                 "megapixels": ("FLOAT", {
                     "default": MEGAPIXELS, "min": 0.1, "max": 16.0, "step": 0.05,
                     "tooltip": "Output size as area, aspect kept (1 MP = 1024x1024). "
                                "1.5-2 is the usual range."}),
+                # appended last: widgets_values are positional
+                "sharpness": ("INT", {
+                    "default": SHARPNESS, "min": 1, "max": SHARPNESS_MAX, "step": 1,
+                    "tooltip": SHARPNESS_TIP}),
             },
         }
 
@@ -2397,11 +2772,11 @@ class HTCTiledUpsampler:
         "only the size is a widget.")
 
     def run(self, model, conditioning, latent, sampler, vae, audio_vae,
-            upscale_model, megapixels):
+            upscale_model, megapixels, sharpness=SHARPNESS):
         import nodes
         from comfy_extras.nodes_audio import vae_decode_audio
         out = upsample(model, conditioning, latent, sampler, str(upscale_model),
-                       float(megapixels))
+                       float(megapixels), sharpness=int(sharpness))
         images = nodes.VAEDecode().decode(vae, out)[0]
         return (images, vae_decode_audio(audio_vae, out))
 
@@ -2441,6 +2816,8 @@ CHAIN_DEFAULTS = {
     "structure_lock": STRUCTURE_LOCK, "lock_sigma": LOCK_SIGMA,
     "attention": "sparse", "chunk_join": "stepped", "chunking": True, "tiling": True,
     "lock_anchor": "source", "tile_context": "none", "redraw_start": 0.6,
+    # set by the chain node's upsample_sharpness widget, not the settings node
+    "sharpness": SHARPNESS,
 }
 
 
@@ -2466,8 +2843,9 @@ class HTCUpsampleSettings:
             "required": {
                 "steps": ("INT", {
                     "default": 3, "min": 1, "max": 8,
-                    "tooltip": "Re-draw steps. 3 = the Regen2K recipe. 2 = a third faster, "
-                               "and in side-by-side tests looked the same."}),
+                    "tooltip": "Re-draw steps. 3 = the recipe. 2 = about a third faster; for "
+                               "Regen2K it looked the same in side-by-side tests, for "
+                               "upsample_redraw ic it starts later, so less is re-drawn."}),
                 "start_sigma": ("FLOAT", {
                     "default": d["start_sigma"], "min": 0.0, "max": 1.0, "step": 0.01,
                     "tooltip": ("Leave at 0 (the Regen2K recipe; redraw_start sets how much "
@@ -2525,7 +2903,7 @@ class HTCUpsampleSettings:
                     "default": d["redraw_start"], "min": 0.3, "max": 0.95, "step": 0.05,
                     "tooltip": "How much the re-draw is allowed to change. 0.6 (default) "
                                "keeps faces close to the chain's frames; 0.8 = the original "
-                               "Regen2K recipe, sharper but faces drift more."}),
+                               "Regen2K recipe, sharper but faces drift more. Regen2K only."}),
             },
             "optional": {
                 "sampler": ("SAMPLER", {
