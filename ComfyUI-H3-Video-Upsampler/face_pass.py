@@ -31,8 +31,6 @@ import torch.nn.functional as F
 TAG = "H3VideoUpsampler"
 
 YUNET_FILE = "face_detection_yunet_2023mar.onnx"
-YUNET_URL = ("https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/"
-             "face_detection_yunet/face_detection_yunet_2023mar.onnx")
 YUNET_SHA256 = "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"
 
 FACE_PASS = True        # False = upsampler output untouched
@@ -76,27 +74,19 @@ def _sha256(path):
     return h.hexdigest()
 
 
+def _bundled_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", YUNET_FILE)
+
+
 def ensure_model():
-    """Path to the YuNet file, downloaded once (232 KB, MIT). None if unavailable."""
-    path = _model_path()
-    if os.path.isfile(path) and _sha256(path) == YUNET_SHA256:
-        return path
-    try:
-        import urllib.request
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        data = urllib.request.urlopen(YUNET_URL, timeout=60).read()
-        if hashlib.sha256(data).hexdigest() != YUNET_SHA256:
-            raise RuntimeError("checksum mismatch")
-        tmp = path + ".part"
-        with open(tmp, "wb") as f:
-            f.write(data)
-        os.replace(tmp, path)
-        print(f"[{TAG}] face detector downloaded to {path}", flush=True)
-        return path
-    except Exception as exc:
-        print(f"[{TAG}] small-face re-draw off: face detector not available ({exc}); "
-              f"put {YUNET_FILE} in {os.path.dirname(path)}", flush=True)
-        return None
+    """Path to the YuNet file (232 KB, MIT), shipped in this pack's models/ folder.
+    A copy in ComfyUI/models/facedetection wins if present. None if unavailable."""
+    for path in (_model_path(), _bundled_path()):
+        if os.path.isfile(path) and _sha256(path) == YUNET_SHA256:
+            return path
+    print(f"[{TAG}] small-face re-draw off: face detector not available; "
+          f"put {YUNET_FILE} in {os.path.dirname(_bundled_path())}", flush=True)
+    return None
 
 
 def _detector(w, h):
