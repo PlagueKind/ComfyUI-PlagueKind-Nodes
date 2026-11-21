@@ -178,9 +178,9 @@ function showImageWidget(node, slot, file) {
 	img.src = slotFileUrl(file);
 
 	div.appendChild(img);
-	const w = node.addDOMWidget(PREVIEW_NAME, "string", div, {
+	const w = node.addDOMWidget(PREVIEW_NAME, "pk_media_preview", div, {
 		serialize: false,
-		surfaces: { canvas: "shown", vueNode: "never", panel: "never" },
+		surfaces: { canvas: "shown", vueNode: "shown", panel: "never" },
 	});
 	w.__pkFile = file;
 	w.__pkH = h;
@@ -231,9 +231,9 @@ function showVideoWidget(node, slot, file) {
 	requestAnimationFrame(applyDims);
 
 	div.appendChild(v);
-	const w = node.addDOMWidget(PREVIEW_NAME, "string", div, {
+	const w = node.addDOMWidget(PREVIEW_NAME, "pk_media_preview", div, {
 		serialize: false,
-		surfaces: { canvas: "shown", vueNode: "never", panel: "never" },
+		surfaces: { canvas: "shown", vueNode: "shown", panel: "never" },
 	});
 	w.__pkFile = file;
 	w.__pkH = h;
@@ -434,7 +434,7 @@ function buildTabBar(node) {
 		}
 	};
 
-	node.addDOMWidget(TAB_BAR_NAME, "string", bar, { serialize: false });
+	node.addDOMWidget(TAB_BAR_NAME, "pk_media_tabs", bar, { serialize: false });
 	// keep the tab bar pinned at the top of the widget list, at a FIXED
 	// height — otherwise the layout treats it as a flexible widget and the
 	// free space in a user-enlarged node pushes the combos down
