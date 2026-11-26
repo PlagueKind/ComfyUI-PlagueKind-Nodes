@@ -105,15 +105,44 @@ class PK_MediaLoader(io.ComfyNode):
 
     # -- loading ----------------------------------------------------------
 
+    @staticmethod
+    def _resolve(name):
+        """Return a loadable annotated name for `name`, or None.
+
+        Names that already resolve are returned untouched. Otherwise the
+        frontend picker may have dropped the subfolder (e.g.
+        "n_00345_.png [output]" for output/moss_image/post/n_00345_.png), so
+        look for the same file name in the subfolders of the folder the tag
+        points at. Exactly one match -> its relative path plus the original
+        tag; no match or several matches -> None.
+        """
+        if folder_paths.exists_annotated_filepath(name):
+            return name
+        stripped, base_dir = folder_paths.annotated_filepath(name)
+        if base_dir is None:
+            base_dir = folder_paths.get_input_directory()
+        tag = name[len(stripped):]
+        target = os.path.basename(stripped)
+        matches = []
+        for root, _dirs, files in os.walk(base_dir):
+            if target in files:
+                matches.append(os.path.join(root, target))
+                if len(matches) > 1:
+                    return None
+        if len(matches) != 1:
+            return None
+        rel = os.path.relpath(matches[0], base_dir).replace(os.sep, "/")
+        return rel + tag
+
     @classmethod
     def _load_image(cls, name):
         """Core Load Image semantics for one (possibly annotated) file name."""
-        images, _mask = nodes.LoadImage().load_image(name)
+        images, _mask = nodes.LoadImage().load_image(cls._resolve(name) or name)
         return images
 
     @classmethod
     def _load_video(cls, name):
-        path = folder_paths.get_annotated_filepath(name)
+        path = folder_paths.get_annotated_filepath(cls._resolve(name) or name)
         components = InputImpl.VideoFromFile(path).get_components()
         images = components.images
         # AUDIO dict {"waveform": (1, C, T), "sample_rate": int} or None when
@@ -157,7 +186,8 @@ class PK_MediaLoader(io.ComfyNode):
                 stamps.append(0)
                 continue
             try:
-                stamps.append(os.path.getmtime(folder_paths.get_annotated_filepath(name)))
+                stamps.append(os.path.getmtime(
+                    folder_paths.get_annotated_filepath(s._resolve(name) or name)))
             except Exception:
                 stamps.append(-1)
         return tuple(names) + tuple(stamps)
@@ -168,8 +198,9 @@ class PK_MediaLoader(io.ComfyNode):
                 + list(kwargs.get(f"video_{i}", NONE) for i in range(1, NUM_VIDEOS + 1)):
             if not name or name == NONE:
                 continue
-            if not folder_paths.exists_annotated_filepath(name):
-                return f"Invalid media file: {name}"
+            if s._resolve(name) is None:
+                return (f"Invalid media file: {name} (not found, or the same "
+                        "file name exists in more than one subfolder)")
         return True
 
     @classmethod
