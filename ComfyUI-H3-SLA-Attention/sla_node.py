@@ -15,6 +15,8 @@ from comfy_api.latest import io
 log = logging.getLogger("H3Utils")
 
 BLOCK_SIZES = ("32", "64", "128")
+# sol_attn's token_aug argument takes 0 or a multiple of 64 up to 256.
+TOKEN_AUG_SIZES = ("0", "64", "128", "256")
 REFERENCE_PROTECTION_MODES = ("Heavy Enforcement", "Light", "Off")
 # Mirrors an existing, widely-used sage-attention kernel dropdown's mode
 # list exactly (see sla/patch.py for the per-mode kernel + pv_accum_dtype
@@ -257,8 +259,10 @@ class H3SLAAttention(io.ComfyNode):
                         "#16072, needs comfy-kitchen>=0.2.32 installed): "
                         "genuine CUDA int8 compute and a built-in pooled tail "
                         "term, but it can only express ONE contiguous "
-                        "protected range, has no reference-quota tier, and "
-                        "has no cross-step stabilize_motion -- reference_"
+                        "protected range, has no reference-quota tier, has no "
+                        "cross-step stabilize_motion, and pins block_size to "
+                        "the kernel's 64-token key blocks (that widget "
+                        "applies to the triton engine only) -- reference_"
                         "protection, multi-span protect_ranges, and "
                         "stabilize_motion are silently disabled (one-time log "
                         "warning each) rather than approximated, and "
@@ -268,6 +272,25 @@ class H3SLAAttention(io.ComfyNode):
                         "on/off setting rather than always applying it. Both "
                         "fall back to dense the same as any other kernel "
                         "failure if their kernel is unavailable or throws.")),
+                io.Combo.Input("token_aug",
+                    display_name="Aug Tokens (engine)",
+                    options=list(TOKEN_AUG_SIZES), default="0", optional=True,
+                    tooltip=(
+                        "Up to this many individual tokens per query block -- "
+                        "the highest-scoring ones OUTSIDE the already-routed "
+                        "key blocks -- get attended to exactly, on top of the "
+                        "routed set (the kernel's own token-augmentation "
+                        "dial; needs a recent comfy-kitchen whose sol_attn "
+                        "exposes it). 0 (default) leaves the call bit-"
+                        "identical to before. 64-128 is a light precision "
+                        "recovery for high-sparsity runs; 256 is the kernel's "
+                        "maximum and its most expensive setting. A complement "
+                        "to tail_correction: the tail folds everything "
+                        "discarded into one pooled term, this rescues the "
+                        "best individual stragglers exactly. comfy_kitchen "
+                        "engine only, and ignored with a one-time log warning "
+                        "on comfy-kitchen wheels whose sol_attn predates the "
+                        "argument. No effect on the triton engine.")),
             ],
             outputs=[io.Model.Output()],
         )
@@ -278,7 +301,8 @@ class H3SLAAttention(io.ComfyNode):
                 enabled=True, dense_steps="1", dense_backend="comfy_kitchen",
                 disable_fp16_accum=True, stabilize_motion=False,
                 reference_protection="Off", tail_correction=False,
-                use_int8_qk=True, engine="comfy_kitchen") -> io.NodeOutput:
+                use_int8_qk=True, engine="comfy_kitchen",
+                token_aug="0") -> io.NodeOutput:
         if not enabled:
             log.info("[H3Utils] SLA disabled; model passed through unchanged.")
             return io.NodeOutput(model)
@@ -300,6 +324,7 @@ class H3SLAAttention(io.ComfyNode):
                 tail_correction=tail_correction,
                 use_int8_qk=use_int8_qk,
                 engine=engine,
+                token_aug=int(token_aug),
             )
         except Exception:                                # noqa: BLE001
             # Triton missing, an incompatible GPU, a ComfyUI API change -- none

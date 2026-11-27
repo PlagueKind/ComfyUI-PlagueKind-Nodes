@@ -314,6 +314,60 @@ def _ck_warn_once(key, message):
         log.warning("[H3Utils] comfy_kitchen engine: %s", message)
 
 
+_CK_ACCEPTED_DTYPES = None
+
+def _ck_accepted_dtypes():
+    """The dtypes the installed sol_attn kernel accepts for q/k/v, cached.
+
+    bfloat16 is the one every wheel in this pack's documented range
+    accepts; current kernels take fp16 too (the installed 0.2.42 CUDA
+    constraint on q/k/v is exactly that pair). Rather than hard-coding what
+    we think the installed version accepts, we ask the installed package's
+    OWN constraint registry -- the same table its dispatcher uses to
+    validate calls -- so "accepted" here is a sufficient condition for the
+    call not to be rejected. If the registry is unavailable (a future
+    layout, a stub install), we stay on the conservative bf16-only default,
+    which only ever costs an extra cast, never a failed call.
+    """
+    global _CK_ACCEPTED_DTYPES
+    if _CK_ACCEPTED_DTYPES is None:
+        accepted = {torch.bfloat16}
+        try:
+            from comfy_kitchen.registry import registry
+            c = registry.get_constraints("cuda", "sol_attn")
+            if c is not None:
+                q = c.params.get("q")
+                if q is not None and getattr(q, "dtypes", None):
+                    accepted = set(q.dtypes) | {torch.bfloat16}
+        except Exception:
+            pass
+        _CK_ACCEPTED_DTYPES = accepted
+    return _CK_ACCEPTED_DTYPES
+
+
+_CK_SOL_PARAMS = None
+
+def _ck_sol_attn_params():
+    """The installed sol_attn's parameter names, cached.
+
+    Feature-detects NEWER arguments (token_aug and future additions) so an
+    older wheel gets a one-time warning instead of a TypeError that would
+    fall the whole run back to dense. Empty when comfy_kitchen itself is
+    absent (the caller's own import guard handles that path).
+    """
+    global _CK_SOL_PARAMS
+    if _CK_SOL_PARAMS is None:
+        try:
+            import inspect
+
+            import comfy_kitchen as ck
+            _CK_SOL_PARAMS = frozenset(
+                inspect.signature(ck.sol_attn).parameters)
+        except Exception:
+            _CK_SOL_PARAMS = frozenset()
+    return _CK_SOL_PARAMS
+
+
 def _ck_rank_blocks_globally(qb, kb, first, last, qk_scale):
     """Rank key blocks [first, last) by a query-AVERAGED pooled score.
 
@@ -380,7 +434,7 @@ def _ck_protected_block_set(qb, kb, NK, prefix, protected_ranges,
 
 def _ck_sol_attn(qb, kb, vb, topk_ratio, prefix, protected_ranges,
                  reference_ranges, reference_sparsity, stabilize_motion,
-                 qk_scale, tail_correction=True, state=None):
+                 qk_scale, tail_correction=True, token_aug=0, state=None):
     """Route through comfy_kitchen's real compiled sol_attn kernel (see
     Comfy-Org/ComfyUI PR #16072, comfy_kitchen>=0.2.32) instead of this
     package's own Triton path -- real CUDA int8 compute and a built-in
@@ -429,6 +483,14 @@ def _ck_sol_attn(qb, kb, vb, topk_ratio, prefix, protected_ranges,
     routing is stateless per call, with no analogue to this file's cross-step
     LUT stickiness. Silently ignored with a one-time warning, same "never
     cost the user their run" policy as the rest of this file.
+
+    ``token_aug`` (0, or a multiple of 64 up to 256) is passed straight
+    through to sol_attn when nonzero: up to that many INDIVIDUAL tokens per
+    query block -- the highest-scoring ones outside the routed key blocks --
+    are attended exactly on top of the routed set. It is a newer sol_attn
+    argument, so it is feature-detected via ``_ck_sol_attn_params`` (one-time
+    warning on wheels that predate it) and a no-op at 0, keeping the default
+    call bit-identical to the pre-change behaviour.
     """
     import comfy_kitchen as ck   # ImportError -> caller's except -> dense()
 
@@ -471,18 +533,30 @@ def _ck_sol_attn(qb, kb, vb, topk_ratio, prefix, protected_ranges,
             )
 
         if protected_blocks:
-            protected_set = set(protected_blocks)
-            rest = [b for b in range(NK) if b not in protected_set]
-            # Guarded the same way prev_lut's one-time allocation is
-            # guarded below: this only runs once per run (cache miss), but
-            # "once" is exactly what trips up a captured/replayed graph if
-            # it isn't told to ignore this allocation -- see this file's
-            # own prev_lut comment for the full reasoning.
-            with pause_malloc_graph():
-                idx = torch.cat([
-                    torch.arange(b * _CK_BLOCK, min(LK, (b + 1) * _CK_BLOCK), device=kb.device)
-                    for b in (protected_blocks + rest)
-                ])
+            if protected_blocks == list(range(len(protected_blocks))):
+                # The protected set is already the leading contiguous run
+                # [0, M): the sink range can point at the front of the
+                # sequence directly, and the "reorder that puts it first" is
+                # the identity permutation. Skip the two full-sequence
+                # index_select copies (each a large fraction of a gigabyte
+                # of bandwidth at 768p/15s) that the general case below
+                # pays on every sparse call -- protect_audio's language
+                # ranges with no audio in the payload are exactly this
+                # shape, so this is the everyday configuration.
+                idx = None
+            else:
+                protected_set = set(protected_blocks)
+                rest = [b for b in range(NK) if b not in protected_set]
+                # Guarded the same way prev_lut's one-time allocation is
+                # guarded below: this only runs once per run (cache miss),
+                # but "once" is exactly what trips up a captured/replayed
+                # graph if it isn't told to ignore this allocation -- see
+                # this file's own prev_lut comment for the full reasoning.
+                with pause_malloc_graph():
+                    idx = torch.cat([
+                        torch.arange(b * _CK_BLOCK, min(LK, (b + 1) * _CK_BLOCK), device=kb.device)
+                        for b in (protected_blocks + rest)
+                    ])
             sink_blocks = [0, len(protected_blocks)]
         else:
             idx = None
@@ -494,17 +568,39 @@ def _ck_sol_attn(qb, kb, vb, topk_ratio, prefix, protected_ranges,
     if idx is not None:
         kb, vb = kb.index_select(1, idx), vb.index_select(1, idx)
 
-    # The CUDA backend rejects anything that isn't literally bfloat16 --
-    # NOT fp16, despite fp16 being "close enough" everywhere else in this
-    # file. Getting this wrong means every call throws immediately and
-    # silently falls back to dense (see the warning this now produces).
-    cast = qb.dtype != torch.bfloat16
+    # The current kernel takes the model's own dtype: 0.2.42's CUDA
+    # constraint on q/k/v is exactly {bf16, fp16}, so the common case (a
+    # bf16 or fp16 H3 run) pays ZERO cast copies at all. Older wheels in
+    # this pack's documented range may be bf16-only, so ask the installed
+    # package's own constraint registry which dtypes its sol_attn accepts
+    # and cast only for dtypes it doesn't (see _ck_accepted_dtypes). The
+    # cast that does happen (an fp32 attention path, say) is cast back on
+    # the way out so the caller sees the dtype it handed us.
+    cast = qb.dtype not in _ck_accepted_dtypes()
     qc, kc, vc = (
         (t.to(torch.bfloat16) if cast else t) for t in (qb, kb, vb)
     )
+
+    # token_aug (0 or a multiple of 64 up to 256): up to this many
+    # individual tokens per query block -- the highest-scoring ones outside
+    # the routed blocks -- attended exactly. A newer sol_attn argument, so
+    # it is feature-detected rather than pinned: older wheels log a one-time
+    # warning and run without it instead of a TypeError falling the run to
+    # dense.
+    extra = {}
+    if token_aug:
+        if "token_aug" in _ck_sol_attn_params():
+            extra["token_aug"] = int(token_aug)
+        else:
+            _ck_warn_once(
+                "token_aug",
+                "token_aug needs a newer comfy_kitchen whose sol_attn exposes "
+                "that argument; it is ignored here (the installed kernel "
+                "predates it).")
+
     out = ck.sol_attn(
         qc, kc, vc, scale=qk_scale, sink_blocks=sink_blocks, sink_q=[0, 0],
-        topk_ratio=topk_ratio, tail=bool(tail_correction),
+        topk_ratio=topk_ratio, tail=bool(tail_correction), **extra
     )
     return out.to(qb.dtype) if cast else out
 
@@ -512,7 +608,8 @@ def _ck_sol_attn(qb, kb, vb, topk_ratio, prefix, protected_ranges,
 def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
                    protect_audio=True, dense_fn=None, stabilize_motion=False,
                    reference_sparsity=None, tail_correction=False,
-                   use_int8_qk=False, use_int8_pv=False, engine="triton"):
+                   use_int8_qk=False, use_int8_pv=False, engine="triton",
+                   token_aug=0):
     """``dense_fn``, when not None, is a specific backend (e.g. always
     ``attention_pytorch``) that every dense fall-through uses instead of
     ``func``. Without it, ``func`` is whatever ``optimized_attention``
@@ -535,6 +632,10 @@ def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
     comfy_kitchen's real compiled sol_attn kernel -- see ``_ck_sol_attn``'s
     docstring for exactly what that engine cannot express relative to
     ``engine="triton"`` (the default, and everything documented above).
+
+    ``token_aug`` (0, or a multiple of 64 up to 256) is forwarded to the
+    comfy_kitchen engine's sol_attn call only (see ``_ck_sol_attn``); the
+    triton engine has no equivalent and ignores it.
     """
     topk_ratio = 1.0 - sparsity_ratio
 
@@ -567,6 +668,15 @@ def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
             or q.shape[2] < min_seq_len
             or to.get("_h3sla_dense", False)
         ):
+            return dense()
+
+        # sparsity 0.0 ("disable sparsity without removing the node") is a
+        # dense call by definition: every kernel in this pack routes a
+        # strict FRACTION of the key blocks, and sol_attn's constraint
+        # system rejects topk_ratio == 1.0 outright. Route it straight to
+        # dense instead of paying a kernel call that can only be rejected
+        # (and would set state["failed"] with a confusing log line).
+        if topk_ratio >= 1.0:
             return dense()
 
         try:
@@ -609,6 +719,7 @@ def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
                                    protected_ranges, reference_ranges,
                                    reference_sparsity, stabilize_motion,
                                    qk_scale, tail_correction=tail_correction,
+                                   token_aug=token_aug,
                                    state=state)
                 # comfy_kitchen's sol_attn hardcodes a 64-token block; these
                 # are for the same run-summary stats the Triton path below
@@ -1048,7 +1159,8 @@ def patch_h3_sla(model, sparsity_ratio=0.90, block_size=64, min_seq_len=8192,
                  dense_last_steps=0, protect_audio=True, dense_backend="comfy_kitchen",
                  dense_steps="", disable_fp16_accum=True, stabilize_motion=False,
                  reference_protection="Off", tail_correction=False,
-                 use_int8_qk=False, use_int8_pv=False, engine="triton"):
+                 use_int8_qk=False, use_int8_pv=False, engine="triton",
+                 token_aug=0):
     """Return a clone of ``model`` whose H3 self-attention runs block-sparse.
 
     Weights are untouched; this only installs an attention override and a
@@ -1133,6 +1245,17 @@ def patch_h3_sla(model, sparsity_ratio=0.90, block_size=64, min_seq_len=8192,
     dense the same as any other kernel failure if their kernel is
     unavailable or throws. A saved workflow with the removed ``"hybrid"``
     value is treated as ``"triton"``.
+
+    ``token_aug`` (comfy_kitchen engine only; 0, or a multiple of 64 up to
+    256) asks sol_attn to attend, exactly, up to that many individual tokens
+    per query block in addition to the routed key blocks -- the
+    highest-scoring ones outside the routed set. A precision-recovery
+    complement to ``tail_correction`` (which folds the entire discarded tail
+    into one pooled term): this rescues the best individual stragglers at
+    exact attention, at a small per-call cost. 0 (the default) leaves the
+    call bit-identical to the pre-change behaviour. Requires a recent
+    comfy-kitchen whose sol_attn exposes the argument; older wheels log a
+    one-time warning and run without it. Ignored by the triton engine.
     """
     if engine == "hybrid":
         log.warning(
@@ -1193,7 +1316,8 @@ def patch_h3_sla(model, sparsity_ratio=0.90, block_size=64, min_seq_len=8192,
         tail_correction=bool(tail_correction),
         use_int8_qk=bool(use_int8_qk),
         use_int8_pv=bool(use_int8_pv),
-        engine=engine)
+        engine=engine,
+        token_aug=int(token_aug))
     patched.model_options["transformer_options"] = to
 
     patched.add_wrapper_with_key(
@@ -1209,12 +1333,12 @@ def patch_h3_sla(model, sparsity_ratio=0.90, block_size=64, min_seq_len=8192,
         "min_seq_len=%d | dense_last_steps=%d | dense_steps=%s | "
         "dense_backend=%s | protect_audio=%s | reference_protection=%s%s | "
         "disable_fp16_accum=%s | stabilize_motion=%s | tail_correction=%s | "
-        "use_int8_qk=%s | use_int8_pv=%s",
+        "use_int8_qk=%s | use_int8_pv=%s | token_aug=%d",
         engine, sparsity_ratio, blkq, blkk, min_seq_len, dense_last_steps,
         sorted(dense_step_set) or "-", dense_backend, protect_audio,
         reference_mode,
         ("(%.2f)" % reference_sparsity) if reference_sparsity is not None else "",
         disable_fp16_accum, stabilize_motion, bool(tail_correction),
-        bool(use_int8_qk), bool(use_int8_pv),
+        bool(use_int8_qk), bool(use_int8_pv), int(token_aug),
     )
     return patched
