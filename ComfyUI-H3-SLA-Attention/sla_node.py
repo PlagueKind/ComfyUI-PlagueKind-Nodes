@@ -290,7 +290,35 @@ class H3SLAAttention(io.ComfyNode):
                         "best individual stragglers exactly. comfy_kitchen "
                         "engine only, and ignored with a one-time log warning "
                         "on comfy-kitchen wheels whose sol_attn predates the "
-                        "argument. No effect on the triton engine.")),
+                        "No effect on the triton engine.")),
+                io.Float.Input("ref_bias",
+                    display_name="Ref Bias (engine)",
+                    default=0.0, min=0.0, max=3.0, step=0.05, optional=True,
+                    tooltip=(
+                        "Natural-log attention boost (an e^value weight "
+                        "multiplier) for the reference key blocks, on top of "
+                        "whatever reference protection is doing. Protection "
+                        "makes references computed exactly; this makes them "
+                        "WEIGHTED -- a floor on their attention mass that is "
+                        "independent of their raw scores. Matters most in the "
+                        "early steps, when video queries score reference "
+                        "tokens weakly and the routed video blocks drown "
+                        "them out, so identity drifts despite perfect "
+                        "protection. 0 (default) = off, bit-identical to "
+                        "before. 1.0 = references weigh ~2.7x their raw "
+                        "score; 2.0 ~ 7.4x; 3.0 ~ 20x. Practical range is "
+                        "~0.5-1.5: A/B it in small steps on real renders -- "
+                        "well past 1.5 the references start starving the "
+                        "attention mass the audio/visual mix needs (the "
+                        "audio goes weird first), the classic over-anchoring "
+                        "failure (texture paste, identity bleed, stiff "
+                        "motion). Only the reference "
+                        "blocks actually in the protected set get it (under "
+                        "Light, the quota-kept subset; under Off there is "
+                        "nothing to bias, and prefix/audio sinks are never "
+                        "biased). Needs a recent comfy-kitchen whose sol_attn "
+                        "accepts key_bias. comfy_kitchen engine only; no "
+                        "effect on the triton engine.")),
             ],
             outputs=[io.Model.Output()],
         )
@@ -302,7 +330,7 @@ class H3SLAAttention(io.ComfyNode):
                 disable_fp16_accum=True, stabilize_motion=False,
                 reference_protection="Off", tail_correction=False,
                 use_int8_qk=True, engine="comfy_kitchen",
-                token_aug="0") -> io.NodeOutput:
+                token_aug="0", ref_bias=0.0) -> io.NodeOutput:
         if not enabled:
             log.info("[H3Utils] SLA disabled; model passed through unchanged.")
             return io.NodeOutput(model)
@@ -325,6 +353,7 @@ class H3SLAAttention(io.ComfyNode):
                 use_int8_qk=use_int8_qk,
                 engine=engine,
                 token_aug=int(token_aug),
+                ref_bias=float(ref_bias),
             )
         except Exception:                                # noqa: BLE001
             # Triton missing, an incompatible GPU, a ComfyUI API change -- none

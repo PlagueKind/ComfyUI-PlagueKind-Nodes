@@ -434,7 +434,8 @@ def _ck_protected_block_set(qb, kb, NK, prefix, protected_ranges,
 
 def _ck_sol_attn(qb, kb, vb, topk_ratio, prefix, protected_ranges,
                  reference_ranges, reference_sparsity, stabilize_motion,
-                 qk_scale, tail_correction=True, token_aug=0, state=None):
+                 qk_scale, tail_correction=True, token_aug=0, ref_bias=0.0,
+                 state=None):
     """Route through comfy_kitchen's real compiled sol_attn kernel (see
     Comfy-Org/ComfyUI PR #16072, comfy_kitchen>=0.2.32) instead of this
     package's own Triton path -- real CUDA int8 compute and a built-in
@@ -491,6 +492,20 @@ def _ck_sol_attn(qb, kb, vb, topk_ratio, prefix, protected_ranges,
     argument, so it is feature-detected via ``_ck_sol_attn_params`` (one-time
     warning on wheels that predate it) and a no-op at 0, keeping the default
     call bit-identical to the pre-change behaviour.
+
+    ``ref_bias`` (>= 0, in natural-log units) is a per-key attention boost
+    for the REFERENCE blocks inside the sink: the kernel's ``key_bias`` adds
+    it to the exact-branch logits of those keys only, multiplying their
+    attention weight by e^alpha relative to the other exact keys -- a weight
+    floor independent of their raw QK scores. Protection (Heavy/Light) makes
+    references computed exactly; this makes them WEIGHTED, which matters
+    most in the early steps, when video queries score reference tokens weakly
+    and the routed video blocks drown them out. It cannot disturb routing
+    (topk selection runs on raw scores, the bias touches the final exact
+    branch only), costs nothing at 0, and is a no-op when the sink holds no
+    reference blocks (reference_protection Off, or the Light quota dropped
+    them). Prefix/audio-only sinks keep a zero bias. The argument is
+    feature-detected like token_aug, and ignored by the triton engine.
     """
     import comfy_kitchen as ck   # ImportError -> caller's except -> dense()
 
@@ -516,6 +531,10 @@ def _ck_sol_attn(qb, kb, vb, topk_ratio, prefix, protected_ranges,
 
     if cached is not None and cached[0] == NK and cached[1] == LK:
         idx, sink_blocks = cached[2], cached[3]
+        # The protected block list rides along too (entry element 4): the
+        # ref_bias mapping below needs to know WHICH original blocks the
+        # sink holds, and on a cache hit it is not computed this call.
+        protected_blocks = cached[4]
     else:
         protected_blocks = None
         if protected_ranges is not None or prefix > 0 or reference_sparsity is not None:
@@ -563,7 +582,7 @@ def _ck_sol_attn(qb, kb, vb, topk_ratio, prefix, protected_ranges,
             sink_blocks = [0, 0]
 
         if cacheable:
-            state["ck_reorder"] = (NK, LK, idx, sink_blocks)
+            state["ck_reorder"] = (NK, LK, idx, sink_blocks, protected_blocks)
 
     if idx is not None:
         kb, vb = kb.index_select(1, idx), vb.index_select(1, idx)
@@ -598,6 +617,31 @@ def _ck_sol_attn(qb, kb, vb, topk_ratio, prefix, protected_ranges,
                 "that argument; it is ignored here (the installed kernel "
                 "predates it).")
 
+    # ref_bias: a natural-log weight floor on the reference keys, attached
+    # per FINAL position -- position p holds original block
+    # protected_blocks[p] (true in the reorder case by construction, and in
+    # the identity-skip case because the protected set IS [0, M)). Only
+    # blocks that START inside a reference range get the boost; prefix and
+    # audio sinks stay zero (protected, but not references).
+    if ref_bias > 0:
+        if "key_bias" in _ck_sol_attn_params():
+            bias = torch.zeros(LK, device=qb.device, dtype=torch.float32)
+            for pos, b in enumerate(protected_blocks or ()):
+                if any(
+                    rs <= b * _CK_BLOCK < re
+                    for rs, re in (reference_ranges or ())
+                ):
+                    bias[pos * _CK_BLOCK:min(LK, (pos + 1) * _CK_BLOCK)] = (
+                        float(ref_bias))
+            if bias.any():
+                extra["key_bias"] = bias
+        else:
+            _ck_warn_once(
+                "ref_bias",
+                "ref_bias needs a newer comfy_kitchen whose sol_attn accepts "
+                "key_bias; it is ignored here (the installed kernel predates "
+                "it).")
+
     out = ck.sol_attn(
         qc, kc, vc, scale=qk_scale, sink_blocks=sink_blocks, sink_q=[0, 0],
         topk_ratio=topk_ratio, tail=bool(tail_correction), **extra
@@ -609,7 +653,7 @@ def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
                    protect_audio=True, dense_fn=None, stabilize_motion=False,
                    reference_sparsity=None, tail_correction=False,
                    use_int8_qk=False, use_int8_pv=False, engine="triton",
-                   token_aug=0):
+                   token_aug=0, ref_bias=0.0):
     """``dense_fn``, when not None, is a specific backend (e.g. always
     ``attention_pytorch``) that every dense fall-through uses instead of
     ``func``. Without it, ``func`` is whatever ``optimized_attention``
@@ -636,6 +680,10 @@ def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
     ``token_aug`` (0, or a multiple of 64 up to 256) is forwarded to the
     comfy_kitchen engine's sol_attn call only (see ``_ck_sol_attn``); the
     triton engine has no equivalent and ignores it.
+
+    ``ref_bias`` (>= 0) is the same story: forwarded to the comfy_kitchen
+    engine only (see ``_ck_sol_attn`` for the exact semantics); the triton
+    engine ignores it.
     """
     topk_ratio = 1.0 - sparsity_ratio
 
@@ -719,7 +767,7 @@ def _make_override(state, sparsity_ratio, blkq, blkk, min_seq_len,
                                    protected_ranges, reference_ranges,
                                    reference_sparsity, stabilize_motion,
                                    qk_scale, tail_correction=tail_correction,
-                                   token_aug=token_aug,
+                                   token_aug=token_aug, ref_bias=ref_bias,
                                    state=state)
                 # comfy_kitchen's sol_attn hardcodes a 64-token block; these
                 # are for the same run-summary stats the Triton path below
@@ -1160,7 +1208,7 @@ def patch_h3_sla(model, sparsity_ratio=0.90, block_size=64, min_seq_len=8192,
                  dense_steps="", disable_fp16_accum=True, stabilize_motion=False,
                  reference_protection="Off", tail_correction=False,
                  use_int8_qk=False, use_int8_pv=False, engine="triton",
-                 token_aug=0):
+                 token_aug=0, ref_bias=0.0):
     """Return a clone of ``model`` whose H3 self-attention runs block-sparse.
 
     Weights are untouched; this only installs an attention override and a
@@ -1256,6 +1304,19 @@ def patch_h3_sla(model, sparsity_ratio=0.90, block_size=64, min_seq_len=8192,
     call bit-identical to the pre-change behaviour. Requires a recent
     comfy-kitchen whose sol_attn exposes the argument; older wheels log a
     one-time warning and run without it. Ignored by the triton engine.
+
+    ``ref_bias`` (comfy_kitchen engine only; >= 0, natural-log units) adds a
+    per-key attention boost to the reference blocks inside the protected
+    set: their exact-branch weight is multiplied by e^ref_bias relative to
+    the other exact keys, independent of their raw scores. Protection makes
+    references computed exactly; this makes them weighted -- most useful in
+    the early steps, when routed video blocks otherwise drown weakly-scored
+    reference tokens. 0 (the default) leaves the call bit-identical to the
+    pre-change behaviour. Over-weighting causes the classic over-anchoring
+    failure (texture paste, identity bleed, stiff motion), so it is a dial
+    to A/B, not a default. Under Light, only the reference blocks the quota
+    keeps are biased; under Off there is nothing to bias. Older wheels log a
+    one-time warning and run without it. Ignored by the triton engine.
     """
     if engine == "hybrid":
         log.warning(
@@ -1317,7 +1378,8 @@ def patch_h3_sla(model, sparsity_ratio=0.90, block_size=64, min_seq_len=8192,
         use_int8_qk=bool(use_int8_qk),
         use_int8_pv=bool(use_int8_pv),
         engine=engine,
-        token_aug=int(token_aug))
+        token_aug=int(token_aug),
+        ref_bias=float(ref_bias))
     patched.model_options["transformer_options"] = to
 
     patched.add_wrapper_with_key(
@@ -1333,12 +1395,13 @@ def patch_h3_sla(model, sparsity_ratio=0.90, block_size=64, min_seq_len=8192,
         "min_seq_len=%d | dense_last_steps=%d | dense_steps=%s | "
         "dense_backend=%s | protect_audio=%s | reference_protection=%s%s | "
         "disable_fp16_accum=%s | stabilize_motion=%s | tail_correction=%s | "
-        "use_int8_qk=%s | use_int8_pv=%s | token_aug=%d",
+        "use_int8_qk=%s | use_int8_pv=%s | token_aug=%d | ref_bias=%.2f",
         engine, sparsity_ratio, blkq, blkk, min_seq_len, dense_last_steps,
         sorted(dense_step_set) or "-", dense_backend, protect_audio,
         reference_mode,
         ("(%.2f)" % reference_sparsity) if reference_sparsity is not None else "",
         disable_fp16_accum, stabilize_motion, bool(tail_correction),
         bool(use_int8_qk), bool(use_int8_pv), int(token_aug),
+        float(ref_bias),
     )
     return patched
